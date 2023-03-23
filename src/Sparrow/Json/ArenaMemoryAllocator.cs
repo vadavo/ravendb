@@ -78,13 +78,29 @@ namespace Sparrow.Json
 
         public bool GrowAllocation(AllocatedMemoryData allocation, int sizeIncrease)
         {
+            var newAllocationSize = allocation.SizeInBytes + sizeIncrease;
+            if (newAllocationSize > MaxArenaSize)
+                return false;
+
+            // we need to keep the total allocation size as power of 2
+            var totalAllocation = Bits.PowerOf2(newAllocationSize);
+            var index = Bits.MostSignificantBit(totalAllocation) - 1;
+            if (_freed[index] != null)
+            {
+                // once we increase the size of the allocation,
+                // it might return to the array of fragmented chunks (_free) for future reuse
+                // however it isn't going to be used since we always request the initial allocation
+                // and only after that we request to grow its size, so it will remain forever in the pool
+                // https://ayende.com/blog/197825-C/production-postmortem-efficiency-all-the-way-to-out-of-memory-error?key=e100f37887a0471db8f78c1a5f831f88
+                return false;
+            }
+
             byte* end = allocation.Address + allocation.SizeInBytes;
             var distance = end - _ptrCurrent;
             if (distance != 0)
                 return false;
 
-            // we need to keep the total allocation size as power of 2
-            sizeIncrease = Bits.PowerOf2(allocation.SizeInBytes + sizeIncrease) - allocation.SizeInBytes;
+            sizeIncrease = totalAllocation - allocation.SizeInBytes;
 
             if (_used + sizeIncrease > _allocated)
                 return false;
@@ -115,7 +131,7 @@ namespace Sparrow.Json
             if (size < 0)
                 throw new ArgumentOutOfRangeException(nameof(size), size,
                     $"Size cannot be negative");
-            
+
             if (size > MaxArenaSize)
                 throw new ArgumentOutOfRangeException(nameof(size), size,
                     $"Requested size {size} while maximum size is {MaxArenaSize}");
@@ -360,8 +376,10 @@ namespace Sparrow.Json
             var address = allocation.Address;
 
 #if DEBUG
-            Debug.Assert(address != _ptrCurrent);
-            Debug.Assert(allocation.IsReturned == false);
+            var current = _ptrCurrent;
+
+            Debug.Assert(address != current, $"address != current ({new IntPtr(address)} != {new IntPtr(current)} [{nameof(_ptrCurrent)} = {new IntPtr(_ptrCurrent)}])");
+            Debug.Assert(allocation.IsReturned == false, "allocation.IsReturned == false");
             allocation.IsReturned = true;
 
 #endif

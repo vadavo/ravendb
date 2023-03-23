@@ -5,6 +5,8 @@
 // -----------------------------------------------------------------------
 
 using System;
+using System.IO;
+using System.Threading;
 using Lucene.Net.Analysis;
 using Lucene.Net.Index;
 using Lucene.Net.Store;
@@ -98,7 +100,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             {
                 // this commit stage is written to the temp scratch buffers
                 var fullPath = directory.TempFullPath;
-                var driveInfo = DiskSpaceChecker.GetDiskSpaceInfo(fullPath);
+                var driveInfo = DiskUtils.GetDiskSpaceInfo(fullPath);
                 var freeSpace = driveInfo != null ? driveInfo.TotalFreeSpace.ToString() : "N/A";
                 throw new DiskFullException($"There isn't enough space to commit the index to {fullPath}. " +
                                             $"Currently available space: {freeSpace}", e);
@@ -110,11 +112,11 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             return _indexWriter.RamSizeInBytes();
         }
 
-        public void Optimize(IState state)
+        public void Optimize(IState state, CancellationToken token)
         {
             try
             {
-                _indexWriter.Optimize(state);
+                _indexWriter.Optimize(state, token);
             }
             catch (SystemException e)
             {

@@ -3,9 +3,9 @@
         <div class="col-sm-12 col-lg-6 flex-vertical flex-noshrink">
             <div class="flex-header flex-horizontal">
                 <div>
-                    <button data-bind="click: addNode, enable: canAddNodes, visible: accessManager.canAddNode" class="btn btn-primary"><i class="icon-plus"></i><span>Add Node to cluster</span></button>
+                    <button data-bind="click: addNode, enable: canAddNodes, visible: accessManager.canAddNode" class="btn btn-primary"><i class="icon-plus"></i><span>Add Node to Cluster</span></button>
                     <button data-bind="click: bootstrapCluster, visible: canBootstrapCluster, css: { 'btn-spinner': $root.spinners.bootstrap }, disable: $root.spinners.bootstrap"
-                            class="btn btn-primary" title="Perform cluster initialization"><i class="icon-cluster"></i><span>Bootstrap cluster</span></button>
+                            class="btn btn-primary" title="Click to initialize cluster"><i class="icon-cluster"></i><span>Bootstrap cluster</span></button>
                 </div>
                 <div class="flex-separator"></div>
                 <div class="flex-end text-muted resources" data-bind="if: utilizedCores() > 0, visible: accessManager.showCoresInfo">
@@ -24,6 +24,20 @@
                     <div class="text-center"><small>Term:</small></div>
                     <div class="text-center">
                         <small><strong data-bind="text: topology().currentTerm().toLocaleString()"></strong></small>
+                    </div>
+                </div>
+            </div>
+            <div data-bind="visible: topology().isPassive()">
+                <div class="passive-node-info bg-info margin-top">
+                    <div class="padding">
+                        <p class="lead margin-bottom">The running server is in a <strong>Passive State</strong>, it is not part of a cluster yet.</p>
+                        <p>Either one of the following can be done to <strong>Bootstrap a Cluster</strong>:</p>
+                        <ul>
+                            <li>Create a new database</li>
+                            <li>Bootstrap the cluster (see button above)</li>
+                            <li>Add another node (see button above), resulting in both nodes being part of the cluster</li>
+                            <li>Register a license (if not registered yet) in the <a target="_blank" data-bind="attr: { href: aboutViewUrl }">About View</a></li>
+                        </ul>
                     </div>
                 </div>
             </div>

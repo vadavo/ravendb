@@ -6,10 +6,11 @@ class trafficWatchItem implements databaseAndNodeAwareStats {
     requestsPerSecond: number;
     writesPerSecond: number;
     dataWritesPerSecond: number;
+    averageDuration: number;
     noData: boolean;
     
     hideDatabaseName: boolean;
-    even: boolean = false;
+    even = false;
     
     constructor(nodeTag: string, data: Raven.Server.Dashboard.TrafficWatchItem) {
         this.nodeTag = nodeTag;
@@ -21,6 +22,7 @@ class trafficWatchItem implements databaseAndNodeAwareStats {
             this.requestsPerSecond = data.RequestsPerSecond;
             this.writesPerSecond = data.DocumentWritesPerSecond + data.AttachmentWritesPerSecond + data.CounterWritesPerSecond + data.TimeSeriesWritesPerSecond;
             this.dataWritesPerSecond = data.DocumentsWriteBytesPerSecond + data.AttachmentsWriteBytesPerSecond + data.CountersWriteBytesPerSecond + data.TimeSeriesWriteBytesPerSecond;
+            this.averageDuration = data.AverageRequestDuration;
         } else {
             this.noData = true;
         }

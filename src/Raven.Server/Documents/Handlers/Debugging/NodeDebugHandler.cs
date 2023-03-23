@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Security;
+using Raven.Client.Http;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Tcp;
 using Raven.Client.Util;
@@ -22,11 +24,19 @@ namespace Raven.Server.Documents.Handlers.Debugging
 {
     public class NodeDebugHandler : RequestHandler
     {
+        [RavenAction("/admin/debug/node/clear-http-clients-pool", "GET", AuthorizationStatus.ClusterAdmin)]
+        public Task ClearHttpClientsPool()
+        {
+            RequestExecutor.ClearHttpClientsPool();
+
+            return NoContent(HttpStatusCode.OK);
+        }
+
         [RavenAction("/admin/debug/node/remote-connections", "GET", AuthorizationStatus.Operator, IsDebugInformationEndpoint = true)]
         public async Task ListRemoteConnections()
         {
             using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            await using (var write = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var write = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 context.Write(write,
                     new DynamicJsonValue
@@ -49,7 +59,7 @@ namespace Raven.Server.Documents.Handlers.Debugging
         public async Task ListRecentEngineLogs()
         {
             using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            await using (var write = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var write = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 context.Write(write, ServerStore.Engine.InMemoryDebug.ToJson());
             }
@@ -59,7 +69,7 @@ namespace Raven.Server.Documents.Handlers.Debugging
         public async Task GetStateChangeHistory()
         {
             using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 writer.WriteStartObject();
                 writer.WriteArray("States", ServerStore.Engine.PrevStates.Select(s => s.ToString()));
@@ -87,7 +97,7 @@ namespace Raven.Server.Documents.Handlers.Debugging
             }
 
             using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 writer.WriteStartObject();
                 writer.WritePropertyName("Result");

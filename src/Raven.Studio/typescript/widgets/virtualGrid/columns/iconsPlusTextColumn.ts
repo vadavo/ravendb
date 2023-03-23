@@ -4,13 +4,17 @@ import virtualColumn = require("widgets/virtualGrid/columns/virtualColumn");
 import virtualGridController = require("widgets/virtualGrid/virtualGridController");
 import genUtils = require("common/generalUtils");
 
-class iconsPlusTextColumn<T> implements virtualColumn {
+class iconsPlusTextColumn<T extends object> implements virtualColumn {
     width: string;
     header: string;
 
     private readonly dataForHtml: (obj: T) => iconPlusText[] | string;
-    
-    constructor(protected gridController: virtualGridController<any>, dataForHtml: (obj: T) => iconPlusText[] | string, header: string, width: string) {
+
+    constructor(protected gridController: virtualGridController<any>,
+                dataForHtml: (obj: T) => iconPlusText[] | string,
+                header: string,
+                width: string,
+                public opts: textColumnOpts<any> = {}) {
         this.width = width;
         this.header = header;
         this.dataForHtml = dataForHtml;
@@ -28,14 +32,23 @@ class iconsPlusTextColumn<T> implements virtualColumn {
         return this.header;
     }
 
-    renderCell(item: T, isSelected: boolean, isSorted: boolean): string {
+    get headerTitle() {
+        const titleToUse = this.opts && this.opts.headerTitle ? this.opts.headerTitle : this.header;
+        return genUtils.unescapeHtml(titleToUse);
+    }
+
+    renderCell(item: T): string {
         const data = this.dataForHtml(item);
         let innerHtml = "";
         
         if (_.isArray(data)) {
             for (let i = 0; i < data.length; i++) {
                 const iconAndText = data[i];
-                innerHtml += `<span title="${genUtils.escapeHtml(iconAndText.title)}" class="${genUtils.escapeHtml(iconAndText.textClass)} margin-right margin-right-sm">
+                
+                const titleToUse = iconAndText.title ?? "";
+                const textClassToUse = iconAndText.textClass ?? "";
+                
+                innerHtml += `<span title="${genUtils.escapeHtml(titleToUse)}" class="${genUtils.escapeHtml(textClassToUse)} margin-right margin-right-sm">
                                   <i class="${genUtils.escapeHtml(iconAndText.iconClass)} margin-right margin-right-xs"></i>${genUtils.escapeHtml(iconAndText.text)}
                               </span>`;
             }

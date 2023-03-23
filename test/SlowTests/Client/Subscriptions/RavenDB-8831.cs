@@ -24,9 +24,11 @@ namespace SlowTests.Client.Subscriptions
         [Fact]
         public async Task ReadDocWithCompressedStringFromOneContextAndWriteToAnother()
         {
+            DoNotReuseServer();
             using (var documentStore = GetDocumentStore())
             {
-                Server.ServerStore.Observer.Suspended = true;
+                Cluster.SuspendObserver(Server);
+
                 var originalDoc = new Doc
                 {
                     Id = "doc/1",
@@ -75,9 +77,11 @@ namespace SlowTests.Client.Subscriptions
         [Fact]
         public async Task SubscriptionShouldRespectDocumentsWithCompressedData()
         {
+            DoNotReuseServer();
             using (var documentStore = GetDocumentStore())
             {
-                Server.ServerStore.Observer.Suspended = true;
+                Cluster.SuspendObserver(Server);
+
                 var originalDoc = new Doc
                 {
                     Id = "doc/1",

@@ -3,9 +3,12 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client;
@@ -375,7 +378,12 @@ namespace FastTests
 
         protected static async Task WaitAndAssertForValueAsync<T>(Func<Task<T>> act, T expectedVal, int timeout = 15000, int interval = 100)
         {
-            var val = await WaitForPredicateAsync(t => t.Equals(expectedVal), act, timeout, interval);
+            var val = await WaitForPredicateAsync(t =>
+            {
+                if (t == null)
+                    return expectedVal == null;
+                return t.Equals(expectedVal);
+            }, act, timeout, interval);
             Assert.Equal(expectedVal, val);
         }
 
@@ -779,6 +787,35 @@ namespace FastTests
                 if (_frozen)
                     throw new InvalidOperationException("Options are frozen and cannot be changed.");
             }
+        }
+
+        public int GetAvailablePort()
+        {
+            var tcpListener = new TcpListener(IPAddress.Loopback, 0);
+            tcpListener.Start();
+            var port = ((IPEndPoint)tcpListener.LocalEndpoint).Port;
+            tcpListener.Stop();
+
+            return port;
+        }
+
+        public static string GenRandomString(int size)
+        {
+            return GenRandomString(new Random(), size);
+        }
+
+        public static string GenRandomString(Random random, int size)
+        {
+            var sb = new StringBuilder(size);
+            // var ran = new Random();
+            var firstCharAsInt = Convert.ToInt32('a');
+            var lastCharAsInt = Convert.ToInt32('z');
+            for (int i = 0; i < size; i++)
+            {
+                sb.Append(Convert.ToChar(random.Next(firstCharAsInt, lastCharAsInt + 1)));
+            }
+
+            return sb.ToString();
         }
     }
 }

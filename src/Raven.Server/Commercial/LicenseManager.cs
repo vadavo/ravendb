@@ -6,11 +6,13 @@ using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Raven.Client;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.ETL;
@@ -27,6 +29,7 @@ using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Certificates;
 using Raven.Client.Util;
+using Raven.Server.Commercial.LetsEncrypt;
 using Raven.Server.Config;
 using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications;
@@ -354,9 +357,9 @@ namespace Raven.Server.Commercial
             await _serverStore.PutNodeLicenseLimitsAsync(nodeTag, detailsPerNode, LicenseStatus.MaxCores, raftRequestId);
         }
 
-        private async Task<NodeInfo> GetNodeInfo(string nodeUrl, TransactionOperationContext ctx)
+        private async Task<Client.ServerWide.Commands.NodeInfo> GetNodeInfo(string nodeUrl, TransactionOperationContext ctx)
         {
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(nodeUrl, _serverStore.Server.Certificate.Certificate))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(nodeUrl, _serverStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var infoCmd = new GetNodeInfoCommand(TimeSpan.FromSeconds(15));
 
@@ -388,6 +391,11 @@ namespace Raven.Server.Commercial
             var licenseStatus = GetLicenseStatus(license);
             if (licenseStatus.Expiration.HasValue == false)
                 throw new LicenseExpiredException("License doesn't have an expiration date!");
+
+            if (licenseStatus.CanActivate(out DateTime? canBeActivateUntil) == false)
+            {
+                throw new LicenseExpiredException($"Cannot activate license because its max activation date has passed: {canBeActivateUntil}");
+            }
 
             if (licenseStatus.Expired)
             {
@@ -692,6 +700,9 @@ namespace Raven.Server.Commercial
             if (license.Equals(currentLicense))
                 return null;
 
+            if (licenseStatus.CanActivate(out _) == false)
+                return null;
+
             return license;
         }
 
@@ -934,6 +945,16 @@ namespace Raven.Server.Commercial
 
         private void ThrowIfCannotActivateLicense(LicenseStatus newLicenseStatus)
         {
+            DateTime certificateNotBefore = new();
+            DateTime certificateNotAfter = new();
+            X509Certificate2 certificate = null;
+            if (_serverStore.Server.Certificate.Certificate != null)
+            {
+                certificateNotBefore  = _serverStore.Server.Certificate.Certificate.NotBefore; 
+                certificateNotAfter  = _serverStore.Server.Certificate.Certificate.NotAfter; 
+                certificate = _serverStore.Server.Certificate.Certificate;   
+            }
+            
             var clusterSize = GetClusterSize();
             var maxClusterSize = newLicenseStatus.MaxClusterSize;
             if (clusterSize > maxClusterSize)
@@ -960,7 +981,7 @@ namespace Raven.Server.Commercial
                 throw GenerateLicenseLimit(LimitType.Snmp, message);
             }
             
-            SecretProtection.ValidateExpiration(nameof(LicenseManager), _serverStore, newLicenseStatus);
+            SecretProtection.ValidateExpiration(nameof(LicenseManager), _serverStore.GetLicenseType(), newLicenseStatus.Type, certificate, certificateNotBefore, certificateNotAfter);
             
             var encryptedDatabasesCount = 0;
             var externalReplicationCount = 0;
@@ -1800,8 +1821,8 @@ namespace Raven.Server.Commercial
 
                     var modifiedJsonObj = context.ReadObject(settingsJson, "modified-settings-json");
 
-                    var indentedJson = SetupManager.IndentJsonString(modifiedJsonObj.ToString());
-                    SetupManager.WriteSettingsJsonLocally(settingsPath, indentedJson);
+                    var indentedJson = JsonStringHelper.Indent(modifiedJsonObj.ToString());
+                    SettingsZipFileHelper.WriteSettingsJsonLocally(settingsPath, indentedJson);
                 }
                 _eulaAcceptedButHasPendingRestart = true;
             }

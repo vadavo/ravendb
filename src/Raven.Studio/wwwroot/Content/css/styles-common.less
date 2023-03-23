@@ -431,8 +431,7 @@ i {
 .btn {
     [class*=" icon-"],
     [class^="icon-"] {
-        top: .1em;
-        transform: scale(1.1);
+        top: .2em;
         display: inline-block;
 
         + span {
@@ -609,7 +608,7 @@ hr {
         }
 
         .icon-edit:before {
-            content: "\e92a";
+            content: "\f116";
             color: @brand-success;
         }
 
@@ -1063,6 +1062,15 @@ input[type=file] + .form-control {
     background-position: center;
     background-size: cover;
     //transform: translateY(-20px);
+
+    .loading-logo {
+        max-width: 240px;
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+    }
+
     .loading-info {
         content: '';
         display: block;
@@ -2015,6 +2023,14 @@ ul.properties {
     padding-right: 0px;
 }
 
+.no-padding-top {
+    padding-top: 0px;
+}
+
+.no-padding-bottom {
+    padding-bottom: 0px;
+}
+
 .clear-left {
     clear: left;
 }
@@ -2074,6 +2090,24 @@ ul.properties {
 
 .border-warning {
     border-color: @brand-warning !important;
+}
+
+.passive-node-info {
+    width: 100%;
+    padding: @gutter;
+    margin-bottom: @gutter !important;
+    background-image: url(../img/pages/about/passive-state-bg.svg);
+    background-position: right center;
+    background-repeat: no-repeat;
+    background-size: auto 100%;
+}
+
+.d-flex {
+    display: flex;
+}
+
+.flex-gap-gutter-xs {
+    gap: @gutter-xs;
 }
 
 @import "prism.less";

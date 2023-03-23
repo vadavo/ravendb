@@ -24,6 +24,7 @@ import viewModelBase = require("viewmodels/viewModelBase");
 import studioSettings = require("common/settings/studioSettings");
 import licenseModel = require("models/auth/licenseModel");
 import generalUtils = require("common/generalUtils");
+import accessManager = require("common/shell/accessManager");
 
 class createDatabase extends dialogViewModelBase {
     
@@ -45,7 +46,7 @@ class createDatabase extends dialogViewModelBase {
     clusterNodes: clusterNode[] = [];
     
     encryptionSection: setupEncryptionKey;
-    usingHttps = location.protocol === "https:"; 
+    isSecureServer = accessManager.default.secureServer();
     operationNotSupported: boolean;
     
     protected currentAdvancedSection = ko.observable<availableConfigurationSectionId>();
@@ -91,7 +92,7 @@ class createDatabase extends dialogViewModelBase {
 
         this.operationNotSupported = mode === "legacyMigration" && clusterTopologyManager.default.nodeInfo().OsInfo.Type !== "Windows";
         
-        const canCreateEncryptedDatabases = ko.pureComputed(() => this.usingHttps && licenseModel.licenseStatus() && licenseModel.licenseStatus().HasEncryption);
+        const canCreateEncryptedDatabases = ko.pureComputed(() => this.isSecureServer && licenseModel.licenseStatus() && licenseModel.licenseStatus().HasEncryption);
         this.databaseModel = new databaseCreationModel(mode, canCreateEncryptedDatabases);
         this.recentPathsAutocomplete = new lastUsedAutocomplete("createDatabasePath", this.databaseModel.path.dataPath);
         this.dataExporterAutocomplete = new lastUsedAutocomplete("dataExporterPath", this.databaseModel.legacyMigration.dataExporterFullPath);
@@ -228,6 +229,7 @@ class createDatabase extends dialogViewModelBase {
         });
 
         this.databaseModel.configurationSections.forEach(section => {
+            // eslint-disable-next-line no-prototype-builtins
             if (!section.hasOwnProperty('validationGroup')) {
                 section.validationGroup = undefined;
             }
@@ -304,19 +306,19 @@ class createDatabase extends dialogViewModelBase {
 
         this.databaseModel.restore.azureCredentials().onCredentialsChange(() => {
             this.updateBackupDirectoryPathOptions();
-            this.databaseModel.fetchRestorePoints(true);
+            this.databaseModel.fetchRestorePoints();
         });
         this.databaseModel.restore.amazonS3Credentials().onCredentialsChange(() => {
             this.updateBackupDirectoryPathOptions();
-            this.databaseModel.fetchRestorePoints(true);
+            this.databaseModel.fetchRestorePoints();
         });
         this.databaseModel.restore.googleCloudCredentials().onCredentialsChange(() => {
             this.updateBackupDirectoryPathOptions();
-            this.databaseModel.fetchRestorePoints(true);
+            this.databaseModel.fetchRestorePoints();
         });
         this.databaseModel.restore.localServerCredentials().onCredentialsChange(() => {
             this.updateBackupDirectoryPathOptions();
-            this.databaseModel.fetchRestorePoints(true);
+            this.databaseModel.fetchRestorePoints();
         });
         
         this.databaseModel.restoreSourceObject.subscribe(() => {
@@ -457,7 +459,7 @@ class createDatabase extends dialogViewModelBase {
     }
 
     getAvailableSections() {
-        let sections = this.databaseModel.configurationSections;
+        const sections = this.databaseModel.configurationSections;
 
         const restoreSection = sections.find(x => x.id === "restore");
         const legacyMigrationSection = sections.find(x => x.id === "legacyMigration");
@@ -530,7 +532,7 @@ class createDatabase extends dialogViewModelBase {
         }
     }
 
-    private createDatabaseInternal(shouldActive: boolean = true): JQueryPromise<Raven.Client.ServerWide.Operations.DatabasePutResult> {
+    private createDatabaseInternal(shouldActive = true): JQueryPromise<Raven.Client.ServerWide.Operations.DatabasePutResult> {
         this.spinners.create(true);
 
         const databaseDocument = this.databaseModel.toDto();
@@ -595,7 +597,7 @@ class createDatabase extends dialogViewModelBase {
             });
     }
 
-    findRestoreSourceLabel(restoreSource: restoreSource) {
+    findRestoreSourceLabel() {
         return this.databaseModel.restoreSourceObject().backupStorageTypeText;
     }
 

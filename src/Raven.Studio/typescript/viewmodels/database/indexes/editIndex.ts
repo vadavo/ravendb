@@ -1,7 +1,6 @@
 import app = require("durandal/app");
 import router = require("plugins/router");
 import viewModelBase = require("viewmodels/viewModelBase");
-import dialog = require("plugins/dialog");
 import indexDefinition = require("models/database/index/indexDefinition");
 import autoIndexDefinition = require("models/database/index/autoIndexDefinition");
 import getIndexDefinitionCommand = require("commands/database/index/getIndexDefinitionCommand");
@@ -40,6 +39,7 @@ import documentHelpers = require("common/helpers/database/documentHelpers");
 import getCustomAnalyzersCommand = require("commands/database/settings/getCustomAnalyzersCommand");
 import getServerWideCustomAnalyzersCommand = require("commands/serverWide/analyzers/getServerWideCustomAnalyzersCommand");
 import getIndexDefaultsCommand = require("commands/database/index/getIndexDefaultsCommand");
+import optimizeDialog = require("viewmodels/database/indexes/optimizeDialog");
 import moment = require("moment");
 import { highlight, languages } from "prismjs";
 
@@ -416,7 +416,7 @@ class editIndex extends viewModelBase {
         this.previewEditor.resize();
     }
 
-    getTimeTooltip(utcTime: string, isRevisionTime: boolean = false) {
+    getTimeTooltip(utcTime: string, isRevisionTime = false) {
         return ko.pureComputed(() => {
             if (utcTime) {
                 const clickInfo = `<div class="margin-top margin-top-sm">Click to load this index revision</div>`;
@@ -769,7 +769,7 @@ class editIndex extends viewModelBase {
                 indexDto.SourceType = typeInfo.IndexSourceType;
                 return new saveIndexDefinitionCommand(indexDto, typeInfo.IndexType === "JavaScriptMap" || typeInfo.IndexType === "JavaScriptMapReduce", db)
                     .execute()
-                    .done((savedIndexName) => {
+                    .done(() => {
                         this.resetDirtyFlag();
                         router.navigate(appUrl.forIndexes(db, this.editedIndex().name()));
                     });
@@ -837,6 +837,11 @@ class editIndex extends viewModelBase {
         app.showBootstrapDialog(new dumpDialog(this.editedIndex().name()));
     }
 
+    openOptimizeDialog() {
+        eventsCollector.default.reportEvent("index", "optimize");
+        app.showBootstrapDialog(new optimizeDialog(this.editedIndex().name()));
+    }
+
     formatIndex(mapIndex: number) {
         eventsCollector.default.reportEvent("index", "format-index");
         const index: indexDefinition = this.editedIndex();
@@ -881,6 +886,7 @@ class editIndex extends viewModelBase {
             const fileNameWoExtension = fileName.substr(0, extensionPosition);
             
             let idx = 1;
+            // eslint-disable-next-line no-constant-condition
             while (true) {
                 const suggestedName = fileNameWoExtension + idx + ".cs";
                 if (_.every(sources(), x => x.name() !== suggestedName)) {
@@ -949,7 +955,8 @@ class editIndex extends viewModelBase {
         popoverUtils.longWithHover($(".store-field-info"),
             {
                 content: `
-                         <ul class="padding padding-xs margin-top-xs margin-left margin-bottom-xs">
+                         <h3 class="margin-top">Please verify whether you need to store the field in the index:</h3>
+                         <ul class="padding padding-xs margin-top margin-left margin-bottom-xs">
                              <li class="margin-bottom"><small>
                                  <strong>Storing the field is Not necessary</strong> in order to filter by the field when querying the index.<br>
                                  Full-text search is also available without storing the field.</small>

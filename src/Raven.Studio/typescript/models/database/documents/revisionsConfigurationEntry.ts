@@ -1,5 +1,6 @@
 /// <reference path="../../../../typings/tsd.d.ts"/>
 import generalUtils = require("common/generalUtils");
+import jsonUtil = require("common/jsonUtil");
 
 class revisionsConfigurationEntry {
 
@@ -37,7 +38,7 @@ class revisionsConfigurationEntry {
     private static readonly revisionsDelta = 100;
     private static readonly revisionsByAgeDelta = 604800; // 7 days
     
-    limitWarningHtml = (byAge: boolean = false) => `The new limit is much lower than the current value (delta > 
+    limitWarningHtml = (byAge = false) => `The new limit is much lower than the current value (delta > 
                         ${byAge ? generalUtils.formatTimeSpan(revisionsConfigurationEntry.revisionsByAgeDelta * 1000, true) : revisionsConfigurationEntry.revisionsDelta}).<br>
                         It is advised to set the # of revisions to delete upon document update.`
     
@@ -47,6 +48,8 @@ class revisionsConfigurationEntry {
         minimumRevisionAgeToKeep: this.minimumRevisionAgeToKeep,
         maxRevisionsToDeleteUponUpdate: this.maxRevisionsToDeleteUponUpdate
     });
+
+    dirtyFlag: () => DirtyFlag;
 
     constructor(collection: string, dto: Raven.Client.Documents.Operations.Revisions.RevisionsCollectionConfiguration) {
         this.collection(collection);
@@ -102,7 +105,7 @@ class revisionsConfigurationEntry {
             const purgeOnText = `<li>A revision will be created anytime a document is modified.</li>
                                  <li>When a document is deleted all its revisions will be removed.</li>`;
 
-            let description = this.purgeOnDelete() ? purgeOnText : purgeOffText;
+            const description = this.purgeOnDelete() ? purgeOnText : purgeOffText;
             return `<ul class="margin-top">${description}</ul>`; 
         });
 
@@ -145,14 +148,14 @@ class revisionsConfigurationEntry {
         this.limitRevisionsByAge.subscribe(() => {
             this.minimumRevisionAgeToKeep.clearError();
         });
-        
-        this.name = ko.pureComputed(() => {
-            if (this.isDefault()) {
-                return "Document Defaults";
 
         this.setMaxRevisionsToDelete.subscribe(() => {
             this.maxRevisionsToDeleteUponUpdate.clearError();
         });
+        
+        this.name = ko.pureComputed(() => {
+            if (this.isDefault()) {
+                return "Document Defaults";
             } 
             if (this.isConflicts()) {
                 return "Conflicting Document Defaults";
@@ -160,6 +163,21 @@ class revisionsConfigurationEntry {
             
             return this.collection();
         });
+
+        this.dirtyFlag = new ko.DirtyFlag([
+            this.collection,
+            this.disabled,
+            this.purgeOnDelete,
+            
+            this.limitRevisions,
+            this.minimumRevisionsToKeep,
+            
+            this.limitRevisionsByAge,
+            this.minimumRevisionAgeToKeep,
+            
+            this.setMaxRevisionsToDelete,
+            this.maxRevisionsToDeleteUponUpdate
+        ], false, jsonUtil.newLineNormalizingHashFunction);
     }
 
     private initValidation() {

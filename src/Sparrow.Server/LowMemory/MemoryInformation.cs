@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using Sparrow.Collections;
@@ -190,10 +191,12 @@ namespace Sparrow.LowMemory
         private static void ThrowInsufficientMemory(MemoryInfoResult memInfo)
         {
             LowMemoryNotification.Instance.SimulateLowMemoryNotification();
-            throw new EarlyOutOfMemoryException($"The amount of available memory to commit on the system is low. Commit charge: {memInfo.CurrentCommitCharge} / {memInfo.TotalCommittableMemory}. Memory: {memInfo.TotalPhysicalMemory - memInfo.AvailableMemory} / {memInfo.TotalPhysicalMemory}", memInfo);
+
+            throw new EarlyOutOfMemoryException($"The amount of available memory to commit on the system is low. " +
+                                                MemoryUtils.GetExtendedMemoryInfo(memInfo), memInfo);
+
         }
-        
-        
+
         public enum JOBOBJECTINFOCLASS
         {
             AssociateCompletionPortInformation = 7,

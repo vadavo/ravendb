@@ -64,6 +64,10 @@ namespace Raven.Server.Rachis
                 _engine.Log.Info($"{ToString()}: Entering steady state");
             }
 
+            AppendEntriesResponse lastAer = null;
+
+            var sw = Stopwatch.StartNew();
+
             while (true)
             {
                 entries.Clear();
@@ -203,13 +207,22 @@ namespace Raven.Server.Rachis
                         return;
                     }
                     _debugRecorder.Record("Processing entries is completed");
-                    _connection.Send(context, new AppendEntriesResponse
+                    var curAer = new AppendEntriesResponse { CurrentTerm = _term, LastLogIndex = lastAcknowledgedIndex, LastCommitIndex = lastCommit, Success = true };
+
+                    bool shouldLog = false;
+                    if (sw.Elapsed.TotalMilliseconds > 10_000)
                     {
-                        CurrentTerm = _term,
-                        LastLogIndex = lastAcknowledgedIndex,
-                        LastCommitIndex = lastCommit,
-                        Success = true
-                    });
+                        shouldLog = true;
+                        sw.Restart();
+                    }
+                    else
+                    {
+                        shouldLog = curAer.Equals(lastAer) == false;
+                    }
+
+                    _connection.Send(context, curAer, shouldLog);
+                    lastAer = curAer;
+
 
                     if (sp.Elapsed > _engine.ElectionTimeout / 2)
                     {
@@ -911,6 +924,18 @@ namespace Raven.Server.Rachis
 
                 if (midpointIndex == negotiation.PrevLogIndex && midpointTerm != negotiation.PrevLogTerm)
                 {
+                    if (HandleDivergenceAtFirstLeaderEntry(context, negotiation, out var lastCommittedIndex))
+                    {
+                        connection.Send(context, new LogLengthNegotiationResponse
+                        {
+                            Status = LogLengthNegotiationResponse.ResponseStatus.Acceptable,
+                            Message = $"agreed on our last committed index {lastCommittedIndex}",
+                            CurrentTerm = _term,
+                            LastLogIndex = lastCommittedIndex,
+                        });
+                        return false;
+                    }
+
                     // our appended entries has been diverged, same index with different terms.
                     if (CanHandleLogDivergence(context, negotiation, ref midpointIndex, ref midpointTerm, ref minIndex, ref maxIndex) == false)
                     {
@@ -966,6 +991,18 @@ namespace Raven.Server.Rachis
                         return true;
                     }
 
+                    if (HandleDivergenceAtFirstLeaderEntry(context, negotiation, out var lastCommittedIndex))
+                    {
+                        connection.Send(context, new LogLengthNegotiationResponse
+                        {
+                            Status = LogLengthNegotiationResponse.ResponseStatus.Acceptable,
+                            Message = $"agreed on our last committed index {lastCommittedIndex}",
+                            CurrentTerm = _term,
+                            LastLogIndex = lastCommittedIndex,
+                        });
+                        return false;
+                    } 
+
                     // the leader already truncated the suggested index
                     // Let's try to negotiate from that index upto our last appended index
                     maxIndex = lastIndex;
@@ -1003,6 +1040,33 @@ namespace Raven.Server.Rachis
                 CurrentTerm = _term,
                 LastLogIndex = midpointIndex,
             });
+
+            return false;
+        }
+
+        private bool HandleDivergenceAtFirstLeaderEntry(ClusterOperationContext context, LogLengthNegotiation negotiation, out long lastCommittedIndex)
+        {
+            lastCommittedIndex = -1;
+
+            using (context.OpenReadTransaction())
+            {
+                var term = _engine.GetTermFor(context, negotiation.PrevLogIndex);
+                if (term != negotiation.PrevLogTerm)
+                {
+                    // divergence at the first leader entry
+                    lastCommittedIndex = _engine.GetLastCommitIndex(context);
+                    if (lastCommittedIndex + 1 == negotiation.PrevLogIndex)
+                    {
+                        if (_engine.Log.IsInfoEnabled)
+                        {
+                            _engine.Log.Info($"{ToString()}: found divergence at the first leader entry");
+                        }
+
+                        // leader's first entry is the next we need 
+                        return true;
+                    }
+                }
+            }
 
             return false;
         }
@@ -1087,22 +1151,14 @@ namespace Raven.Server.Rachis
         {
             try
             {
-                try
-                {
-                    Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
-                }
-                catch (Exception e)
-                {
-                    if (_engine.Log.IsInfoEnabled)
-                    {
-                        _engine.Log.Info($"{_debugName} was unable to set the thread priority, will continue with the same priority", e);
-                    }
-                }
+                ThreadHelper.TrySetThreadPriority(ThreadPriority.AboveNormal, _debugName, _engine.Log);
 
                 using (this)
                 {
                     try
                     {
+                        _engine.ForTestingPurposes?.LeaderLock?.HangThreadIfLocked();
+
                         using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
                         {
                             NegotiateWithLeader(context, (LogLengthNegotiation)obj);

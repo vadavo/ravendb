@@ -87,7 +87,7 @@ namespace Raven.Server.Documents
                     {
                         throw new ConcurrencyException(
                             $"Cannot PUT document '{id}' because its change vector's cluster transaction index is set to {indexFromChangeVector} " +
-                            $"but the compare exchange guard ('{ClusterTransactionCommand.GetAtomicGuardKey(id)}') is set to {indexFromCluster}")
+                            $"but the compare exchange guard ('{ClusterTransactionCommand.GetAtomicGuardKey(id)}') is {(val == null ? "missing" : $"set to {indexFromCluster}")}")
                         {
                             Id = id
                         };
@@ -233,7 +233,7 @@ namespace Raven.Server.Documents
                             var oldFlags = TableValueToFlags((int)DocumentsTable.Flags, ref oldValue);
                             var oldTicks = TableValueToDateTime((int)DocumentsTable.LastModified, ref oldValue);
                             
-                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, oldDoc, oldFlags | DocumentFlags.HasRevisions, NonPersistentDocumentFlags.None,
+                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, oldDoc, oldFlags | DocumentFlags.HasRevisions | DocumentFlags.FromOldDocumentRevision, NonPersistentDocumentFlags.None,
                                 oldChangeVector, oldTicks.Ticks, configuration, collectionName);
                         }
                         

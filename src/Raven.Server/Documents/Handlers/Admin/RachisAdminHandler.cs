@@ -4,12 +4,14 @@ using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Cluster;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations.Certificates;
+using Raven.Client;
 using Raven.Server.Commercial;
 using Raven.Server.Extensions;
 using Raven.Server.Json;
@@ -129,7 +131,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             if (ServerStore.IsLeader())
             {
                 using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
-                await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+                await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
                 {
                     var res = ServerStore.Observer.ReadDecisionsForDatabase();
                     var json = new DynamicJsonValue
@@ -152,7 +154,7 @@ namespace Raven.Server.Documents.Handlers.Admin
         public async Task GetLogs()
         {
             using (ServerStore.Engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
-            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 context.OpenReadTransaction();
                 context.Write(writer, ServerStore.GetLogDetails(context));
@@ -163,7 +165,7 @@ namespace Raven.Server.Documents.Handlers.Admin
         public async Task GetHistoryLogs()
         {
             using (ServerStore.Engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
-            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 writer.WriteStartObject();
                 context.OpenReadTransaction();
@@ -222,7 +224,7 @@ namespace Raven.Server.Documents.Handlers.Admin
 
                 HttpContext.Response.StatusCode = (int)HttpStatusCode.OK;
 
-                await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+                await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
                 {
                     var loadLicenseLimits = ServerStore.LoadLicenseLimits();
                     var nodeLicenseDetails = loadLicenseLimits == null ?
@@ -305,9 +307,9 @@ namespace Raven.Server.Documents.Handlers.Admin
 
             tag = tag?.Trim();
 
-            NodeInfo nodeInfo;
+            Client.ServerWide.Commands.NodeInfo nodeInfo;
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(nodeUrl, Server.Certificate.Certificate))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(nodeUrl, Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 requestExecutor.DefaultTimeout = ServerStore.Engine.OperationTimeout;
 
@@ -388,7 +390,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                         if (nodeInfo.Certificate == null)
                             throw new InvalidOperationException($"Cannot add node {nodeTag} with url {nodeUrl} to cluster because it has no certificate while trying to use HTTPS");
 
-                        certificate = new X509Certificate2(Convert.FromBase64String(nodeInfo.Certificate), (string)null, X509KeyStorageFlags.MachineKeySet);
+                        certificate = CertificateLoaderUtil.CreateCertificate(Convert.FromBase64String(nodeInfo.Certificate));
 
                         var now = DateTime.UtcNow;
                         if (certificate.NotBefore.ToUniversalTime() > now)
@@ -430,6 +432,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                                     Thumbprint = certificate.Thumbprint,
                                     PublicKeyPinningHash = certificate.GetPublicKeyPinningHash(),
                                     NotAfter = certificate.NotAfter,
+                                    NotBefore = certificate.NotBefore,
                                     Name = "Server Certificate for " + nodeUrl,
                                     SecurityClearance = SecurityClearance.ClusterNode
                                 };
@@ -500,7 +503,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             RedirectToLeader();
         }
 
-        private static void AssertCanAddNodeWithTopologyId(ClusterTopology clusterTopology, NodeInfo nodeInfo, string nodeUrl)
+        private static void AssertCanAddNodeWithTopologyId(ClusterTopology clusterTopology, Client.ServerWide.Commands.NodeInfo nodeInfo, string nodeUrl)
         {
             if (clusterTopology.TopologyId != nodeInfo.TopologyId)
             {
@@ -678,7 +681,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                         }
 
                         var cmd = new RemoveEntryFromRaftLogCommand(index);
-                        using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(node.Value, Server.Certificate.Certificate))
+                        using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(node.Value, Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
                         {
                             await requestExecutor.ExecuteAsync(cmd, context);
                             nodeList.AddRange(cmd.Result);

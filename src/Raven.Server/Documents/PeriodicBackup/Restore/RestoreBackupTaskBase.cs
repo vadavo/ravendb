@@ -10,6 +10,7 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Smuggler;
+using Raven.Client.Extensions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
@@ -35,6 +36,7 @@ using Sparrow.Utils;
 using Voron.Data.Tables;
 using Voron.Impl.Backup;
 using Voron.Util.Settings;
+using BackupUtils = Raven.Client.Documents.Smuggler.BackupUtils;
 using Index = Raven.Server.Documents.Indexes.Index;
 
 namespace Raven.Server.Documents.PeriodicBackup.Restore
@@ -320,6 +322,13 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
 
                                 result.AddInfo($"Successfully restored {result.SnapshotRestore.ReadCount} files during snapshot restore, took: {sw.ElapsedMilliseconds:#,#;;0}ms");
                                 onProgress.Invoke(result.Progress);
+
+                                using (var tx = context.OpenWriteTransaction())
+                                {
+                                    var changeVector = database.DocumentsStorage.GetNewChangeVector(context);
+                                    database.DocumentsStorage.SetDatabaseChangeVector(context, changeVector.ChangeVector);
+                                    tx.Commit();
+                                }
                             }
                             else
                             {
@@ -340,6 +349,21 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                     // after the db for restore is done, we can safely set the db state to normal and write the DatabaseRecord
                     databaseRecord.DatabaseState = DatabaseStateStatus.Normal;
                     await SaveDatabaseRecordAsync(databaseName, databaseRecord, null, result, onProgress);
+
+                    result.AddInfo($"Loading the database after restore");
+
+                    try
+                    {
+                        await _serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName, addToInitLog: message => result.AddInfo(message));
+                    }
+                    catch (Exception e)
+                    {
+                        // we failed to load the database after restore, we don't want to fail the entire restore process since it will delete the database if we throw here
+                        result.AddError($"Failed to load the database after restore, {e}");
+
+                        if (Logger.IsOperationsEnabled)
+                            Logger.Operations($"Failed to load the database '{databaseName}' after restore", e);
+                    }
 
                     return result;
                 }
@@ -412,7 +436,7 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                     try
                     {
                         index = Index.Open(indexPath, database, generateNewDatabaseId: true);
-        }
+                    }
                     catch (Exception e)
                     {
                         result.AddError($"Could not open index from path '{indexPath}'. Error: {e.Message}");
@@ -710,10 +734,33 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                     databaseRecord.LockMode = smugglerDatabaseRecord.LockMode;
                     databaseRecord.OlapConnectionStrings = smugglerDatabaseRecord.OlapConnectionStrings;
                     databaseRecord.OlapEtls = smugglerDatabaseRecord.OlapEtls;
+                    databaseRecord.ElasticSearchEtls = smugglerDatabaseRecord.ElasticSearchEtls;
+                    databaseRecord.ElasticSearchConnectionStrings = smugglerDatabaseRecord.ElasticSearchConnectionStrings;
 
                     // need to enable revisions before import
                     database.DocumentsStorage.RevisionsStorage.InitializeFromDatabaseRecord(smugglerDatabaseRecord);
                 });
+
+            long totalExecutedCommands = 0;
+
+            //when restoring from a backup, the database doesn't exist yet and we cannot rely on the DocumentDatabase to execute the database cluster transaction commands
+            while (true)
+            {
+                _operationCancelToken.Token.ThrowIfCancellationRequested();
+
+                using (database.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext serverContext))
+                using (serverContext.OpenReadTransaction())
+                {
+                    // the commands are already batched (10k or 16MB), so we are executing only 1 at a time
+                    var executed = await database.ExecuteClusterTransaction(serverContext, batchSize: 1);
+                    if (executed.Count == 0)
+                        break;
+
+                    totalExecutedCommands += executed.Sum(x => x.Commands.Length);
+                    result.AddInfo($"Executed {totalExecutedCommands:#,#;;0} cluster transaction commands.");
+                    onProgress.Invoke(result.Progress);
+                }
+            }
         }
 
         private bool IsDefaultDataDirectory(string dataDirectory, string databaseName)
@@ -748,14 +795,6 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             if (RestoreFromConfiguration.DisableOngoingTasks == false)
                 return;
 
-            if (databaseRecord.ExternalReplications != null)
-            {
-                foreach (var task in databaseRecord.ExternalReplications)
-                {
-                    task.Disabled = true;
-                }
-            }
-
             if (databaseRecord.RavenEtls != null)
             {
                 foreach (var task in databaseRecord.RavenEtls)
@@ -767,6 +806,22 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             if (databaseRecord.SqlEtls != null)
             {
                 foreach (var task in databaseRecord.SqlEtls)
+                {
+                    task.Disabled = true;
+                }
+            }
+
+            if (databaseRecord.OlapEtls != null)
+            {
+                foreach (var task in databaseRecord.OlapEtls)
+                {
+                    task.Disabled = true;
+                }
+            }
+
+            if (databaseRecord.ElasticSearchEtls != null)
+            {
+                foreach (var task in databaseRecord.ElasticSearchEtls)
                 {
                     task.Disabled = true;
                 }
@@ -821,7 +876,8 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                     database.Time, options, result: restoreResult, onProgress: onProgress, token: _operationCancelToken.Token)
                 {
                     OnIndexAction = onIndexAction,
-                    OnDatabaseRecordAction = onDatabaseRecordAction
+                    OnDatabaseRecordAction = onDatabaseRecordAction,
+                    BackupKind = BackupUtils.IsFullBackup(Path.GetExtension(filePath)) ? BackupKind.Full : BackupKind.Incremental
                 };
                 await smuggler.ExecuteAsync(ensureStepsProcessed: false, isLastFile);
             }
@@ -859,7 +915,10 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                         {
                             var source = new StreamSource(uncompressed, context, database);
                             var smuggler = new Smuggler.Documents.DatabaseSmuggler(database, source, destination,
-                                database.Time, smugglerOptions, onProgress: onProgress, token: _operationCancelToken.Token);
+                                database.Time, smugglerOptions, onProgress: onProgress, token: _operationCancelToken.Token)
+                            {
+                                BackupKind = BackupKind.Incremental
+                            };
 
                             await smuggler.ExecuteAsync(ensureStepsProcessed: true, isLastFile: true);
                         }

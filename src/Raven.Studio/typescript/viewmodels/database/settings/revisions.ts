@@ -259,6 +259,11 @@ class revisions extends viewModelBase {
         $.when<any>(...saveTasks)
             .done(() => {
                 this.dirtyFlag().reset();
+                
+                this.defaultConflictConfiguration()?.dirtyFlag().reset();
+                this.defaultDocumentConfiguration()?.dirtyFlag().reset();
+                this.perCollectionConfigurations().forEach(item => item.dirtyFlag().reset());
+                
                 messagePublisher.reportSuccess(`Revisions configuration has been saved`);
             })
             .always(() => {
@@ -289,8 +294,11 @@ class revisions extends viewModelBase {
 
     editItem(entry: revisionsConfigurationEntry) {
         this.currentBackingItem(entry);
+        
         const clone = revisionsConfigurationEntry.empty().copyFrom(entry);
         this.currentlyEditedItem(clone);
+
+        this.currentlyEditedItem().validationGroup.errors.showAllMessages(false);
     }
 
     deleteItem(entry: revisionsConfigurationEntry) {
@@ -348,7 +356,7 @@ class revisions extends viewModelBase {
     }
 
     formattedDurationObservable(observable: KnockoutObservable<number>) {
-        return ko.pureComputed(() => generalUtils.formatTimeSpan(observable() * 1000));
+        return ko.pureComputed(() => generalUtils.formatTimeSpan(observable() * 1000, true));
     }
 
     enforceConfiguration() {

@@ -3,6 +3,7 @@
 import d3 = require("d3");
 import clusterNode = require("models/database/cluster/clusterNode");
 import graphHelper = require("common/helpers/graph/graphHelper");
+import icomoonHelpers from "common/helpers/view/icomoonHelpers";
 
 interface clusterNodeWithLayout extends clusterNode {
     x: number;
@@ -218,16 +219,18 @@ class clusterGraph {
 
         const nodeIcon = (node: clusterNodeWithLayout) => {
             if (node.tag() === leaderTag) {
-                return "&#xe9d5;";
+                return icomoonHelpers.getCodePointForCanvas("node-leader");
             }
 
             switch (node.type()) {
                 case "Member":
-                    return "&#xe9ca;";
+                    return icomoonHelpers.getCodePointForCanvas("cluster-member");
                 case "Promotable":
-                    return "&#xe9cc;";
+                    return icomoonHelpers.getCodePointForCanvas("cluster-promotable");
                 case "Watcher":
-                    return leaderTag ? "&#xe9cd;" : "&#xe9a9;";
+                    return leaderTag 
+                        ? icomoonHelpers.getCodePointForCanvas("cluster-watcher")
+                        : icomoonHelpers.getCodePointForCanvas("waiting")
             }
             return "";
         };
@@ -255,8 +258,8 @@ class clusterGraph {
     }
 
     private updateEdges(selection: d3.Selection<clusterGraphEdge<clusterNodeWithLayout>>, leaderTag: string) {
-        const leaderDistance = 52;
-        const nonLeaderDistance = 45;
+        const leaderDistance = clusterGraph.circleRadius + 3;
+        const nonLeaderDistance = clusterGraph.circleRadius + 7;
 
         selection
             .select(".edge-line")

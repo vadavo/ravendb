@@ -21,6 +21,7 @@ import documentMetadata = require("models/database/documents/documentMetadata");
 import generalUtils = require("common/generalUtils");
 import fileImporter = require("common/fileImporter");
 import moment = require("moment");
+import sqlConnectionStringSyntax = require("common/helpers/database/sqlConnectionStringSyntax");
 
 interface exportDataDto {
     Schema: Raven.Server.SqlMigration.Schema.DatabaseSchema,
@@ -159,6 +160,30 @@ class importDatabaseFromSql extends viewModelBase {
         this.registerDisposableHandler($(document), "fullscreenchange", () => {
             $("body").toggleClass("fullscreen", $(document).fullScreen());
         });
+
+        popoverUtils.longWithHover($("#js-mssql-syntax"), {
+            html: true,
+            content: sqlConnectionStringSyntax.mssqlSyntax,
+            placement: "top"
+        });
+
+        popoverUtils.longWithHover($("#js-mysql-syntax"), {
+            html: true,
+            content: sqlConnectionStringSyntax.mysqlSyntax,
+            placement: "top"
+        });
+
+        popoverUtils.longWithHover($("#js-npgsql-syntax"), {
+            html: true,
+            content: sqlConnectionStringSyntax.npgsqlSyntax,
+            placement: "top"
+        });
+
+        popoverUtils.longWithHover($("#js-oracle-syntax"), {
+            html: true,
+            content: sqlConnectionStringSyntax.oracleSyntax,
+            placement: "top"
+        });
     }
     
     fileSelected(fileName: string) {
@@ -187,6 +212,7 @@ class importDatabaseFromSql extends viewModelBase {
         }
 
         // Check correctness of data
+        // eslint-disable-next-line no-prototype-builtins
         if (!importedData.hasOwnProperty('Schema') || !importedData.hasOwnProperty('Configuration')) {
             messagePublisher.reportError("Invalid SQL migration file format", undefined, undefined);
         } else {

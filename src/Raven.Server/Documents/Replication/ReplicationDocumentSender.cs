@@ -20,6 +20,8 @@ using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
+using Sparrow.Server;
+using Sparrow.Threading;
 using Voron;
 
 namespace Raven.Server.Documents.Replication
@@ -37,6 +39,11 @@ namespace Raven.Server.Documents.Replication
         private OutgoingReplicationStatsScope _statsInstance;
         internal readonly ReplicationStats _stats = new ReplicationStats();
         public bool MissingAttachmentsInLastBatch { get; private set; }
+        private HashSet<Slice> _deduplicatedAttachmentHashes = new(SliceComparer.Instance);
+        private Queue<Slice> _deduplicatedAttachmentHashesLru = new();
+        private int _numberOfAttachmentsTrackedForDeduplication;
+        private ByteStringContext _context; // required to clone the hashes 
+
 
         public ReplicationDocumentSender(Stream stream, OutgoingReplicationHandler parent, Logger log, string[] pathsToSend, string[] destinationAcceptablePaths)
         {
@@ -51,6 +58,10 @@ namespace Raven.Server.Documents.Replication
             _shouldSkipSendingTombstones = _parent.Destination is PullReplicationAsSink sink && sink.Mode == PullReplicationMode.SinkToHub &&
                                            parent._outgoingPullReplicationParams?.PreventDeletionsMode?.HasFlag(PreventDeletionsMode.PreventSinkToHubDeletions) == true &&
                                            _parent._database.ForTestingPurposes?.ForceSendTombstones == false;
+            
+            _numberOfAttachmentsTrackedForDeduplication = parent._database.Configuration.Replication.MaxNumberOfAttachmentsTrackedForDeduplication;
+            _context = new ByteStringContext(SharedMultipleUseFlag.None);
+
         }
 
         public class MergedReplicationBatchEnumerator : IEnumerator<ReplicationBatchItem>
@@ -242,13 +253,15 @@ namespace Raven.Server.Documents.Replication
                         Context = documentsContext,
                         LastTransactionMarker = -1,
                         NumberOfItemsSent = 0,
-                        Size = 0L
+                        Size = 0L,
+                        ScannedItems = 0
                     };
 
                     using (_stats.Storage.Start())
                     {
                         foreach (var item in GetReplicationItems(_parent._database, documentsContext, _lastEtag, _stats, _parent.SupportedFeatures.Replication.CaseInsensitiveCounters))
                         {
+                            replicationState.ScannedItems++;
                             _parent.ForTestingPurposes?.OnDocumentSenderFetchNewItem?.Invoke();
 
                             _parent.CancellationToken.ThrowIfCancellationRequested();
@@ -307,7 +320,6 @@ namespace Raven.Server.Documents.Replication
                             }
 
                             replicationState.Size += item.Size;
-
                             replicationState.NumberOfItemsSent++;
                         }
                     }
@@ -436,6 +448,22 @@ namespace Raven.Server.Documents.Replication
                         return false;
                     }
                 }
+            }
+
+            if (state.ScannedItems == 1)
+            {
+                /*
+                 always scan at least one item.
+                after scanning 1 item we can move to the batch size limit check.
+                We need to check here the "ScannedItems" and not the "NumberOfItemsSent"
+                because there's an option that we will scan a lot of items (documents) but we won't send them.
+                When we load the items from an encrypted database, the memory is locked until the transaction is closed
+                (for preventing the decrypted data from being moved to the "swap-file" by the OS in case of low memory).
+                In that case, if we will check here if the "NumberOfItemsSent" is 0 instead, there's an option 
+                that we will load a lot of "not relevant" items to memory and it will be locked until we'll fill 
+                the batch and it can cause eventually to OOM.
+                 */
+                return true;
             }
 
             // We want to limit batch sizes to reasonable limits.
@@ -637,13 +665,47 @@ namespace Raven.Server.Documents.Replication
 
             if (item is AttachmentReplicationItem attachment)
             {
-                _replicaAttachmentStreams[attachment.Base64Hash] = attachment;
+                if(ShouldSendAttachmentStream(attachment)) 
+                    _replicaAttachmentStreams[attachment.Base64Hash] = attachment;
 
                 if (MissingAttachmentsInLastBatch)
                     state.MissingAttachmentBase64Hashes?.Remove(attachment.Base64Hash);
             }
 
             _orderedReplicaItems.Add(item.Etag, item);
+            return true;
+        }
+
+        private bool ShouldSendAttachmentStream(AttachmentReplicationItem attachment)
+        {
+            if (MissingAttachmentsInLastBatch)
+            {
+                // we intentionally not trying to de-duplicate in this scenario
+                // we may have _sent_ the attachment already, but it was deleted at 
+                // destination, so we need to send it again
+                return true;
+            }
+
+            if (_parent.SupportedFeatures.Replication.DeduplicatedAttachments == false)
+                return true;
+
+            // RavenDB does de-duplication of attachments on storage, but not over the wire
+            // Here we implement the same idea, if (in the current connection), we already sent
+            // an attachment, we will skip sending it to the other side since we _know_ it is 
+            // already there.
+            if (_deduplicatedAttachmentHashes.Contains(attachment.Base64Hash))
+                return false; // we already sent it over during the current run
+                    
+            var clone = attachment.Base64Hash.Clone(_context);
+            _deduplicatedAttachmentHashes.Add(clone);
+            _deduplicatedAttachmentHashesLru.Enqueue(clone);
+            while (_deduplicatedAttachmentHashesLru.Count > _numberOfAttachmentsTrackedForDeduplication)
+            {
+                var cur = _deduplicatedAttachmentHashesLru.Dequeue();
+                _deduplicatedAttachmentHashes.Remove(cur);
+                _context.Release(ref cur.Content);
+            }
+
             return true;
         }
 
@@ -672,7 +734,8 @@ namespace Raven.Server.Documents.Replication
                         // we let pass all the conflicted/resolved revisions, since we keep them with their original change vector which might be `AlreadyMerged` at the destination.
                         if (doc.Flags.Contain(DocumentFlags.Conflicted) ||
                             doc.Flags.Contain(DocumentFlags.Resolved) ||
-                            (doc.Flags.Contain(DocumentFlags.FromClusterTransaction)))
+                            doc.Flags.Contain(DocumentFlags.FromClusterTransaction) ||
+                            doc.Flags.Contain(DocumentFlags.FromOldDocumentRevision))
                         {
                             return false;
                         }
@@ -680,8 +743,12 @@ namespace Raven.Server.Documents.Replication
 
                     break;
 
-                case AttachmentReplicationItem _:
+                case AttachmentReplicationItem attachment:
                     if (MissingAttachmentsInLastBatch)
+                        return false;
+
+                    var type = AttachmentsStorage.GetAttachmentTypeByKey(attachment.Key);
+                    if (type == AttachmentType.Revision)
                     {
                         return false;
                     }
@@ -726,6 +793,13 @@ namespace Raven.Server.Documents.Replication
         {
             if (_log.IsInfoEnabled)
                 _log.Info($"Starting sending replication batch ({_parent._database.Name}) with {_orderedReplicaItems.Count:#,#;;0} docs, and last etag {_lastEtag:#,#;;0}");
+
+            if (_parent.ForTestingPurposes?.OnMissingAttachmentStream != null &&
+                _parent.MissingAttachmentsRetries > 0)
+            {
+                var replicaAttachmentStreams = _replicaAttachmentStreams;
+                _parent.ForTestingPurposes?.OnMissingAttachmentStream?.Invoke(replicaAttachmentStreams);
+            }
 
             var sw = Stopwatch.StartNew();
             var headerJson = new DynamicJsonValue
@@ -806,6 +880,7 @@ namespace Raven.Server.Documents.Replication
         {
             _pathsToSend?.Dispose();
             _destinationAcceptablePaths?.Dispose();
+            _context.Dispose();
         }
         private class ReplicationState
         {
@@ -819,6 +894,7 @@ namespace Raven.Server.Documents.Replication
             public short LastTransactionMarker;
             public int? BatchSize;
             public Size? MaxSizeToSend;
+            public int ScannedItems;
         }
     }
 }

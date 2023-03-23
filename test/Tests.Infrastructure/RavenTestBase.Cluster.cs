@@ -4,8 +4,14 @@ using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Esprima.Ast;
+using Lucene.Net.Documents;
+using Raven.Client.Documents;
+using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.ServerWide;
 using Raven.Server;
+using Raven.Server.Monitoring.Snmp;
 using Raven.Server.Rachis;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json.Parsing;
@@ -37,6 +43,17 @@ public partial class RavenTestBase
         {
             var updateIndex = LastRaftIndexForCommand(_parent.Server, commandType);
             await _parent.Server.ServerStore.Cluster.WaitForIndexNotification(updateIndex, TimeSpan.FromSeconds(10));
+        }
+
+        public async Task CreateIndexInClusterAsync(IDocumentStore store, AbstractIndexCreationTask index, List<RavenServer> nodes = null)
+        {
+            var results = (await store.Maintenance.ForDatabase(store.Database)
+                                        .SendAsync(new PutIndexesOperation(index.CreateIndexDefinition())))
+                                        .Single(r => r.Index == index.IndexName);
+
+            // wait for index creation on cluster
+            nodes ??= _parent.Servers;
+            await WaitForRaftIndexToBeAppliedOnClusterNodesAsync(results.RaftCommandIndex, nodes);
         }
 
         public long LastRaftIndexForCommand(RavenServer server, string commandType)
@@ -183,6 +200,14 @@ public partial class RavenTestBase
                 }
             }
             return string.Join(Environment.NewLine, states.OrderBy(x => x.transition.When).Select(x => $"State for {x.tag}-term{x.Item2.CurrentTerm}:{Environment.NewLine}{x.Item2.From}=>{x.Item2.To} at {x.Item2.When:o} {Environment.NewLine}because {x.Item2.Reason}"));
+        }
+
+        public void SuspendObserver(RavenServer server)
+        {
+            // observer is set in the background task, hence we are waiting for it to not be null
+            WaitForValue(() => server.ServerStore.Observer != null, true);
+
+            server.ServerStore.Observer.Suspended = true;
         }
     }
 }

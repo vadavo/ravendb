@@ -17,7 +17,6 @@ import aceEditorBindingHandler = require("common/bindingHelpers/aceEditorBinding
 import getPossibleMentorsCommand = require("commands/database/tasks/getPossibleMentorsCommand");
 import jsonUtil = require("common/jsonUtil");
 import popoverUtils = require("common/popoverUtils");
-import tasksCommonContent = require("models/database/tasks/tasksCommonContent");
 import backupSettings = require("models/database/tasks/periodicBackup/backupSettings");
 import testPeriodicBackupCredentialsCommand = require("commands/serverWide/testPeriodicBackupCredentialsCommand");
 import getPeriodicBackupConfigCommand = require("commands/database/tasks/getPeriodicBackupConfigCommand");
@@ -195,16 +194,21 @@ class olapTaskTestMode {
             new testOlapEtlCommand(this.db(), dto)
                 .execute()
                 .done((testResult: Raven.Server.Documents.ETL.Providers.OLAP.Test.OlapEtlTestScriptResult) => {
-                    this.testResults(testResult.ItemsByPartition.map(x => new partitionTable(x)));
+                    const $testResults = '.test-container a[href="#testResults"]';
+                    
+                    // wait for tabs animation (if needed)
+                    setTimeout(() => {
+                        this.testResults(testResult.ItemsByPartition.map(x => new partitionTable(x)));
+                    }, 300);
                     this.debugOutput(testResult.DebugOutput);
                     this.transformationErrors(testResult.TransformationErrors);
 
                     if (this.warningsCount()) {
                         $('.test-container a[href="#warnings"]').tab('show');
                     } else {
-                        $('.test-container a[href="#testResults"]').tab('show');
+                        $($testResults).tab('show');
                     }
-
+                    
                     this.testAlreadyExecuted(true);
                 })
                 .always(() => this.spinners.test(false));
@@ -219,6 +223,8 @@ class editOlapEtlTask extends viewModelBase {
     connectionStringOlapView = require("views/database/settings/connectionStringOlap.html");
     backupConfigurationView = require("views/partial/backupConfigurationScript.html");
     backupDestinationLocalView = require("views/partial/backupDestinationLocal.html");
+    pinResponsibleNodeButtonsScriptView = require("views/partial/pinResponsibleNodeButtonsScript.html");
+    pinResponsibleNodeTextScriptView = require("views/partial/pinResponsibleNodeTextScript.html");
 
     static readonly scriptNamePrefix = "Script_";
     enableTestArea = ko.observable<boolean>(false);
@@ -322,11 +328,6 @@ class editOlapEtlTask extends viewModelBase {
         super.compositionComplete();
 
         $('.edit-raven-olap-task [data-toggle="tooltip"]').tooltip();
-
-        popoverUtils.longWithHover($(".responsible-node"),
-            {
-                content: tasksCommonContent.responsibleNodeInfo
-            });
 
         popoverUtils.longWithHover($(".keep-files-on-disk"),
             {
@@ -539,7 +540,7 @@ class editOlapEtlTask extends viewModelBase {
         }
                 
         // 5. All is well, Save connection string (if relevant..) 
-        let savingNewStringAction = $.Deferred<void>();
+        const savingNewStringAction = $.Deferred<void>();
         if (this.createNewConnectionString()) {
             this.newConnectionString()
                 .saveConnectionString(this.activeDatabase())

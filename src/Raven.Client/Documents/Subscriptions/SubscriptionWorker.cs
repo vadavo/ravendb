@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -232,7 +233,7 @@ namespace Raven.Client.Documents.Subscriptions
                     TcpConnectionHeaderMessage.OperationTypes.Subscription,
                     NegotiateProtocolVersionForSubscriptionAsync,
                     context,
-                    requestExecutor.DefaultTimeout,
+                    _options?.ConnectionStreamTimeout, 
                     null
 #if TCP_CLIENT_CANCELLATIONTOKEN_SUPPORT
                     ,
@@ -241,7 +242,7 @@ namespace Raven.Client.Documents.Subscriptions
                     ).ConfigureAwait(false);
 
                 _tcpClient = result.TcpClient;
-                _stream = result.Stream;
+                _stream = new StreamWithTimeout(result.Stream);
                 _supportedFeatures = result.SupportedFeatures;
 
                 _tcpClient.NoDelay = true;
@@ -771,7 +772,7 @@ namespace Raven.Client.Documents.Subscriptions
                                 var nextNodeIndex = (_forcedTopologyUpdateAttempts++) % curTopology.Count;
                                 try
                                 {
-                                    (_, _redirectNode) = await reqEx.GetRequestedNode(curTopology[nextNodeIndex].ClusterTag).ConfigureAwait(false);
+                                    (_, _redirectNode) = await reqEx.GetRequestedNode(curTopology[nextNodeIndex].ClusterTag, throwIfContainsFailures: true).ConfigureAwait(false);
                                     if (_logger.IsInfoEnabled)
                                         _logger.Info($"Subscription '{_options.SubscriptionName}'. Will modify redirect node from null to {_redirectNode.ClusterTag}", ex);
                                 }
@@ -858,6 +859,12 @@ namespace Raven.Client.Documents.Subscriptions
 
                     return true;
 
+                case DatabaseDisabledException:
+                case AllTopologyNodesDownException:
+                {
+                    AssertLastConnectionFailure();
+                    return true;
+                }
                 case NodeIsPassiveException e:
                     {
                         // if we failed to talk to a node, we'll forget about it and let the topology to
@@ -883,9 +890,15 @@ namespace Raven.Client.Documents.Subscriptions
                 case SubscriptionInvalidStateException _:
                 case DatabaseDoesNotExistException _:
                 case AuthorizationException _:
-                case AllTopologyNodesDownException _:
                 case SubscriberErrorException _:
-                case RavenException _:
+                    _processingCts.Cancel();
+                    return false;
+                case RavenException re:
+                    if (re.InnerException is HttpRequestException or TimeoutException)
+                    {
+                        goto default;
+                    }
+
                     _processingCts.Cancel();
                     return false;
 

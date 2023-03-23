@@ -37,22 +37,14 @@ namespace Raven.Server.Rachis
         {
             try
             {
-                try
-                {
-                    Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
-                }
-                catch (Exception e)
-                {
-                    if (_engine.Log.IsInfoEnabled)
-                    {
-                        _engine.Log.Info("Elector was unable to set the thread priority, will continue with the same priority", e);
-                    }
-                }
+                ThreadHelper.TrySetThreadPriority(ThreadPriority.AboveNormal, ToString(), _engine.Log);
 
                 using (this)
                 {
                     while (_engine.IsDisposed == false)
                     {
+                        _engine.ForTestingPurposes?.LeaderLock?.HangThreadIfLocked();
+
                         using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
                         {
                             var rv = _connection.Read<RequestVote>(context);

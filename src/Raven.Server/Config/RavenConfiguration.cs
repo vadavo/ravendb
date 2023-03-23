@@ -42,8 +42,11 @@ namespace Raven.Server.Config
 
         public bool Initialized { get; private set; }
 #endif
+        public LicenseConfiguration Licensing { get; }
 
         public CoreConfiguration Core { get; }
+
+        public SecurityConfiguration Security { get; }
 
 #if !RVN
         public HttpConfiguration Http { get; }
@@ -55,8 +58,6 @@ namespace Raven.Server.Config
         public ClusterConfiguration Cluster { get; }
 
         public StorageConfiguration Storage { get; }
-
-        public SecurityConfiguration Security { get; }
 
         public BackupConfiguration Backup { get; }
 
@@ -80,8 +81,6 @@ namespace Raven.Server.Config
 
         public PerformanceHintsConfiguration PerformanceHints { get; }
 
-        public LicenseConfiguration Licensing { get; }
-
         public TombstoneConfiguration Tombstones { get; }
 
         public SubscriptionsConfiguration Subscriptions { get; }
@@ -99,6 +98,8 @@ namespace Raven.Server.Config
         internal IConfigurationRoot ServerWideSettings { get; set; }
 
         internal IConfigurationRoot Settings { get; set; }
+
+        public TrafficWatchConfiguration TrafficWatch { get; }
 
         internal string ConfigPath => _customConfigPath
                        ?? Path.Combine(AppContext.BaseDirectory, "settings.json");
@@ -148,6 +149,7 @@ namespace Raven.Server.Config
             Notifications = new NotificationsConfiguration();
             Updates = new UpdatesConfiguration();
             Migration = new MigrationConfiguration();
+            TrafficWatch = new TrafficWatchConfiguration();
             Integrations = new IntegrationsConfiguration();
         }
 
@@ -208,6 +210,7 @@ namespace Raven.Server.Config
             Notifications.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Updates.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Migration.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
+            TrafficWatch.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Integrations.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
 
             PostInit();

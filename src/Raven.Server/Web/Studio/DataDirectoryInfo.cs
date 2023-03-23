@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Http;
 using Raven.Server.Json;
 using Raven.Server.ServerWide;
@@ -48,8 +49,8 @@ namespace Raven.Server.Web.Studio
         public async Task UpdateDirectoryResult(string databaseName, string error)
         {
             var drivesInfo = PlatformDetails.RunningOnPosix ? DriveInfo.GetDrives() : null;
-            var driveInfo = DiskSpaceChecker.GetDriveInfo(_path, drivesInfo, out var realPath);
-            var diskSpaceInfo = DiskSpaceChecker.GetDiskSpaceInfo(driveInfo.DriveName);
+            var driveInfo = DiskUtils.GetDriveInfo(_path, drivesInfo, out var realPath);
+            var diskSpaceInfo = DiskUtils.GetDiskSpaceInfo(driveInfo.DriveName, driveInfo);
 
             if (CanAccessPath(_path, out var pathAccessError) == false)
                 error = pathAccessError;
@@ -190,7 +191,7 @@ namespace Raven.Server.Web.Studio
             {
                 try
                 {
-                    using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(serverUrl, _serverStore.Server.Certificate.Certificate))
+                    using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(serverUrl, _serverStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
                     using (_serverStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
                     {
                         var dataDirectoryInfo = new GetDataDirectoryInfoCommand(_path, _name, _isBackup);

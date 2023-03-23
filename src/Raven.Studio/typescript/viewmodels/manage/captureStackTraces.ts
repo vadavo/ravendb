@@ -7,6 +7,7 @@ import copyToClipboard = require("common/copyToClipboard");
 import fileDownloader = require("common/fileDownloader");
 import fileImporter = require("common/fileImporter");
 import genUtils = require("common/generalUtils");
+import icomoonHelpers from "common/helpers/view/icomoonHelpers";
 
 type stackFrame = {
     short: string;
@@ -24,7 +25,7 @@ class stackInfo {
         if (withoutArgs.includes('+')) {
             return withoutArgs.replace(/.*\.(.*\+.*)/, '$1');
         } else {
-            return withoutArgs.replace(/.*\.([^\.]+\.[^\.]+)$/, '$1');
+            return withoutArgs.replace(/.*\.([^.]+\.[^.]+)$/, '$1');
         }
     }
 
@@ -345,9 +346,8 @@ class captureStackTraces extends viewModelBase {
 
         enteringNodes.filter(d => d.depth > 0).each(function (d: stackInfo, index: number) {
             if (d.threadNamesHeight() > 0) {
-                const threadContainer = this;
                 const offsetTop = d.boxHeight() - stackInfo.boxPadding + stackInfo.lineHeight/4;
-                const framesContainer = d3.select(threadContainer)
+                const framesContainer = d3.select(this)
                     .append("g")
                     .attr('class', 'traces')
                     .style('clip-path', () => 'url(#stack-clip-path-' + index + ')');
@@ -398,15 +398,14 @@ class captureStackTraces extends viewModelBase {
         buttonGroup
             .append("text")
             .attr("class", "icon-style copy")
-            .html("&#xe943;")
+            .html(icomoonHelpers.getCodePointForCanvas("copy-to-clipboard"))
             .attr("text-anchor", "middle")
             .attr("x", -stackInfo.headerSize / 2)
             .attr("y", 0);
         
         enteringNodes.filter(d => d.depth > 0).each(function (d: stackInfo, index: number) {
-            const threadContainer = this;
             const offsetTop = d.boxHeight() - stackInfo.boxPadding - stackInfo.lineHeight/2 - d.threadNamesHeight();
-            const framesContainer = d3.select(threadContainer)
+            const framesContainer = d3.select(this)
                 .append("g")
                 .attr('class', 'traces')
                 .style('clip-path', () => 'url(#stack-clip-path-' + index + ')');
@@ -483,7 +482,7 @@ class captureStackTraces extends viewModelBase {
                 .done(stacks => {
                     stacks.forEach(stack => {
                         if (stack.Stacks) {
-                            this.reverseStacks(stack.Stacks);    
+                            stack.Stacks = captureStackTraces.reverseStacks(stack.Stacks);
                         }
                         
                         const serverUrl = tagMapping[stack.NodeTag];
@@ -500,7 +499,7 @@ class captureStackTraces extends viewModelBase {
                 .done(stacks => {
                     this.data = stacks;
                     this.hasAnyData(true);
-                    this.reverseStacks(stacks.Results);
+                    this.data.Results = captureStackTraces.reverseStacks(stacks.Results);
                     this.draw();
                 })
                 .always(() => this.spinners.loading(false));
@@ -579,9 +578,14 @@ class captureStackTraces extends viewModelBase {
         $container.empty();
     }
     
-    private reverseStacks(data: rawStackTraceResponseItem[]) {
-        data.forEach(d => {
-            d.StackTrace = d.StackTrace.reverse();
+    private static reverseStacks(data: rawStackTraceResponseItem[]): rawStackTraceResponseItem[] {
+        return data.map(x => {
+            const { StackTrace, ...rest } = x;
+            
+            return {
+                ...rest,
+                StackTrace: StackTrace.reverse()
+            }
         });
     }
     
@@ -597,7 +601,11 @@ class captureStackTraces extends viewModelBase {
     }
     
     exportAsJson() {
-        fileDownloader.downloadAsJson(this.data, "stacks.json");
+        const dataCopy: stackTracesResponseDto = {
+            Results: captureStackTraces.reverseStacks(this.data.Results),
+            Threads: this.data.Threads
+        };
+        fileDownloader.downloadAsJson(dataCopy, "stacks.json");
     }
 
     fileSelected(fileInput: HTMLInputElement) {
@@ -606,6 +614,14 @@ class captureStackTraces extends viewModelBase {
 
     private dataImported(result: string) {
         this.data = JSON.parse(result);
+        
+        // imported data might have 2 origins:
+        // - exported via this view
+        // - from debug package
+        
+        // in both cases we need to reverse stacks
+        
+        this.data.Results = captureStackTraces.reverseStacks(this.data.Results);
         this.draw();
     }
 }

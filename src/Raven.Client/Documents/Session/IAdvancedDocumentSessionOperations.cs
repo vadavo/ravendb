@@ -116,18 +116,16 @@ namespace Raven.Client.Documents.Session
         string GetDocumentId(object entity);
 
         /// <summary>
-        ///     Gets the metadata for the specified entity.
-        ///     If the entity is transient, it will load the metadata from the store
-        ///     and associate the current state of the entity with the metadata from the server.
+        ///     Gets the metadata for the specified instance.
+        ///     Throws an exception if the instance is not tracked by the session.
         /// </summary>
         /// <param name="instance">The instance.</param>
         IMetadataDictionary GetMetadataFor<T>(T instance);
 
 
         /// <summary>
-        ///     Gets change vector for the specified entity.
-        ///     If the entity is transient, it will load the metadata from the store
-        ///     and associate the current state of the entity with the metadata from the server.
+        ///     Gets change vector for the specified instance.
+        ///     Throws an exception if the instance is not tracked by the session.
         /// </summary>
         /// <param name="instance">The instance.</param>
         string GetChangeVectorFor<T>(T instance);
@@ -177,6 +175,11 @@ namespace Raven.Client.Documents.Session
         /// Returns all changes for each entity stored within session. Including name of the field/property that changed, its old and new value and change type.
         /// </summary>
         IDictionary<string, DocumentsChanges[]> WhatChanged();
+
+        /// <summary>
+        /// Returns all the tracked entities in this session.
+        /// </summary>
+        IDictionary<string, EntityInfo> GetTrackedEntities();
 
         /// <summary>
         /// SaveChanges will wait for the changes made to be replicates to `replicas` nodes

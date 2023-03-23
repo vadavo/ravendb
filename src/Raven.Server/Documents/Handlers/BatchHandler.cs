@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +12,8 @@ using Microsoft.Net.Http.Headers;
 using Raven.Client.Documents.Attachments;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Commands.Batches;
+using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Linq;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.Counters;
 using Raven.Client.Documents.Session;
@@ -22,7 +23,9 @@ using Raven.Client.Exceptions.Documents;
 using Raven.Client.Json;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Patch;
+using Raven.Server.Documents.PeriodicBackup;
 using Raven.Server.Documents.Replication;
+using Raven.Server.Documents.TimeSeries;
 using Raven.Server.Json;
 using Raven.Server.Rachis;
 using Raven.Server.Routing;
@@ -43,6 +46,8 @@ namespace Raven.Server.Documents.Handlers
 {
     public class BatchHandler : DatabaseRequestHandler
     {
+        private static TimeSeriesStorage.AppendOptions AppendOptionsForTimeSeriesCopy = new() { VerifyName = false };
+
         [RavenAction("/databases/*/bulk_docs", "POST", AuthorizationStatus.ValidUser, EndpointType.Write, DisableOnCpuCreditsExhaustion = true)]
         public async Task BulkDocs()
         {
@@ -72,7 +77,7 @@ namespace Raven.Server.Documents.Handlers
                         BatchTrafficWatch(command.ParsedCommands);
                     }
                 }
-                
+
                 var disableAtomicDocumentWrites = GetBoolValueQueryString("disableAtomicDocumentWrites", required: false) ??
                                                   Database.Configuration.Cluster.DisableAtomicDocumentWrites;
 
@@ -84,7 +89,7 @@ namespace Raven.Server.Documents.Handlers
 
                 if (command.IsClusterTransaction)
                 {
-                    ValidateCommandForClusterWideTransaction(command);
+                    ValidateCommandForClusterWideTransaction(command, disableAtomicDocumentWrites);
 
                     using (Database.ClusterTransactionWaiter.CreateTask(out var taskId))
                     {
@@ -125,8 +130,9 @@ namespace Raven.Server.Documents.Handlers
 
                 if (waitForIndexesTimeout != null)
                 {
+                    long lastEtag = ChangeVectorUtils.GetEtagById(command.LastChangeVector, Database.DbBase64Id);
                     await WaitForIndexesAsync(ContextPool, Database, waitForIndexesTimeout.Value, specifiedIndexesQueryString.ToList(), waitForIndexThrow,
-                        command.LastChangeVector, command.LastTombstoneEtag, command.ModifiedCollections);
+                        lastEtag, command.LastTombstoneEtag, command.ModifiedCollections);
                 }
 
                 HttpContext.Response.StatusCode = (int)HttpStatusCode.Created;
@@ -142,7 +148,7 @@ namespace Raven.Server.Documents.Handlers
 
         private void CheckBackwardCompatibility(ref bool disableAtomicDocumentWrites)
         {
-            if (disableAtomicDocumentWrites) 
+            if (disableAtomicDocumentWrites)
                 return;
 
             if (RequestRouter.TryGetClientVersion(HttpContext, out var clientVersion) == false)
@@ -157,31 +163,39 @@ namespace Raven.Server.Documents.Handlers
             }
         }
 
-        private static void ValidateCommandForClusterWideTransaction(MergedBatchCommand command)
+        private static void ValidateCommandForClusterWideTransaction(MergedBatchCommand command, bool disableAtomicDocumentWrites)
         {
-            foreach (var document in command.ParsedCommands)
+            foreach (var commandData in command.ParsedCommands)
             {
-                switch (document.Type)
+                switch (commandData.Type)
                 {
-                    case CommandType.PUT:
-                    case CommandType.DELETE:
                     case CommandType.CompareExchangePUT:
                     case CommandType.CompareExchangeDELETE:
-                        if (document.Type == CommandType.PUT)
+
+                        if (disableAtomicDocumentWrites == false)
                         {
-                            if (document.SeenAttachments)
-                                throw new NotSupportedException($"The document {document.Id} has attachments, this is not supported in cluster wide transaction.");
+                            if (ClusterTransactionCommand.IsAtomicGuardKey(commandData.Id, out _))
+                                throw new CompareExchangeInvalidKeyException($"You cannot manipulate the atomic guard '{commandData.Id}' via the cluster-wide session");
+                        }
 
-                            if (document.SeenCounters)
-                                throw new NotSupportedException($"The document {document.Id} has counters, this is not supported in cluster wide transaction.");
+                        break;
+                    case CommandType.PUT:
+                    case CommandType.DELETE:
+                        if (commandData.Type == CommandType.PUT)
+                        {
+                            if (commandData.SeenAttachments)
+                                throw new NotSupportedException($"The document {commandData.Id} has attachments, this is not supported in cluster wide transaction.");
 
-                            if (document.SeenTimeSeries)
-                                throw new NotSupportedException($"The document {document.Id} has time series, this is not supported in cluster wide transaction.");
+                            if (commandData.SeenCounters)
+                                throw new NotSupportedException($"The document {commandData.Id} has counters, this is not supported in cluster wide transaction.");
+
+                            if (commandData.SeenTimeSeries)
+                                throw new NotSupportedException($"The document {commandData.Id} has time series, this is not supported in cluster wide transaction.");
                         }
                         break;
 
                     default:
-                        throw new ArgumentOutOfRangeException($"The command type {document.Type} is not supported in cluster transaction.");
+                        throw new ArgumentOutOfRangeException($"The command type {commandData.Type} is not supported in cluster transaction.");
                 }
             }
         }
@@ -341,13 +355,16 @@ namespace Raven.Server.Documents.Handlers
                               $"to {numberOfReplicasToWaitFor} servers in {waitForReplicasTimeout}. " +
                               $"So far, it only replicated to {replicatedPast}";
 
-                throw new TimeoutException(message);
+                throw new RavenTimeoutException(message)
+                {
+                    FailImmediately = true
+                };
             }
         }
 
         public static async Task WaitForIndexesAsync(DocumentsContextPool contextPool, DocumentDatabase database, TimeSpan timeout,
             List<string> specifiedIndexesQueryString, bool throwOnTimeout,
-            string lastChangeVector, long lastTombstoneEtag, HashSet<string> modifiedCollections)
+            long lastDocumentEtag, long lastTombstoneEtag, HashSet<string> modifiedCollections)
         {
             // waitForIndexesTimeout=timespan & waitForIndexThrow=false (default true)
             // waitForSpecificIndex=specific index1 & waitForSpecificIndex=specific index 2
@@ -384,8 +401,7 @@ namespace Raven.Server.Documents.Handlers
                 needsServerContext |= index.Definition.HasCompareExchange;
             }
 
-            var lastEtag = lastChangeVector != null ? ChangeVectorUtils.GetEtagById(lastChangeVector, database.DbBase64Id) : 0;
-            var cutoffEtag = Math.Max(lastEtag, lastTombstoneEtag);
+            var cutoffEtag = Math.Max(lastDocumentEtag, lastTombstoneEtag);
 
             while (true)
             {
@@ -394,8 +410,9 @@ namespace Raven.Server.Documents.Handlers
                 using (var context = QueryOperationContext.Allocate(database, needsServerContext))
                 using (context.OpenReadTransaction())
                 {
-                    foreach (var waitForIndexItem in indexesToWait)
+                    for (var i = 0; i < indexesToWait.Count; i++)
                     {
+                        var waitForIndexItem = indexesToWait[i];
                         if (waitForIndexItem.Index.IsStale(context, cutoffEtag) == false)
                             continue;
 
@@ -408,9 +425,7 @@ namespace Raven.Server.Documents.Handlers
                             if (throwOnTimeout == false)
                                 return;
 
-                            throw new TimeoutException(
-                                $"After waiting for {sp.Elapsed}, could not verify that {indexesToCheck.Count} " +
-                                $"indexes has caught up with the changes as of etag: {cutoffEtag}");
+                            ThrowTimeoutException(indexesToWait, i, sp, context, cutoffEtag);
                         }
                     }
                 }
@@ -418,6 +433,48 @@ namespace Raven.Server.Documents.Handlers
                 if (hadStaleIndexes == false)
                     return;
             }
+        }
+
+        private static void ThrowTimeoutException(List<WaitForIndexItem> indexesToWait, int i, Stopwatch sp, QueryOperationContext context, long cutoffEtag)
+        {
+            var staleIndexesCount = 0;
+            var erroredIndexes = new List<string>();
+            var pausedIndexes = new List<string>();
+
+            for (var j = i; j < indexesToWait.Count; j++)
+            {
+                var index = indexesToWait[j].Index;
+
+                if (index.State == IndexState.Error)
+                {
+                    erroredIndexes.Add(index.Name);
+                }
+                else if (index.Status == IndexRunningStatus.Paused)
+                {
+                    pausedIndexes.Add(index.Name);
+                }
+
+                if (index.IsStale(context, cutoffEtag))
+                    staleIndexesCount++;
+            }
+
+            var errorMessage = $"After waiting for {sp.Elapsed}, could not verify that all indexes has caught up with the changes as of etag: {cutoffEtag:#,#;;0}. " +
+                               $"Total relevant indexes: {indexesToWait.Count}, total stale indexes: {staleIndexesCount}";
+
+            if (erroredIndexes.Count > 0)
+            {
+                errorMessage += $", total errored indexes: {erroredIndexes.Count} ({string.Join(", ", erroredIndexes)})";
+            }
+
+            if (pausedIndexes.Count > 0)
+            {
+                errorMessage += $", total paused indexes: {pausedIndexes.Count} ({string.Join(", ", pausedIndexes)})";
+            }
+
+            throw new RavenTimeoutException(errorMessage)
+            {
+                FailImmediately = true
+            };
         }
 
         private static List<Index> GetImpactedIndexesToWaitForToBecomeNonStale(DocumentDatabase database, List<string> specifiedIndexesQueryString, HashSet<string> modifiedCollections)
@@ -440,6 +497,9 @@ namespace Raven.Server.Documents.Handlers
             {
                 foreach (var index in database.IndexStore.GetIndexes())
                 {
+                    if (index.State is IndexState.Disabled)
+                        continue;
+
                     if (index.Collections.Contains(Constants.Documents.Collections.AllDocumentsCollection) ||
                         index.WorksOnAnyCollection(modifiedCollections))
                     {
@@ -455,7 +515,9 @@ namespace Raven.Server.Documents.Handlers
             protected readonly DocumentDatabase Database;
             public HashSet<string> ModifiedCollections;
             public string LastChangeVector;
+
             public long LastTombstoneEtag;
+            public long LastDocumentEtag;
 
             public DynamicJsonArray Reply = new DynamicJsonArray();
 
@@ -467,6 +529,7 @@ namespace Raven.Server.Documents.Handlers
             protected void AddPutResult(DocumentsStorage.PutOperationResults putResult)
             {
                 LastChangeVector = putResult.ChangeVector;
+                LastDocumentEtag = putResult.Etag;
                 ModifiedCollections?.Add(putResult.Collection.Name);
 
                 // Make sure all the metadata fields are always been add
@@ -580,12 +643,16 @@ namespace Raven.Server.Documents.Handlers
                                 case CommandType.PUT:
                                     if (current < count)
                                     {
-                                        // delete the document to avoid exception if we put new document in a different collection.
-                                        // TODO: document this behavior
-                                        using (DocumentIdWorker.GetSliceFromId(context, cmd.Id, out Slice lowerId))
+                                        // if the document came from a full backup it must have the same collection
+                                        // the only thing that we update is the change vector
+                                        if (cmd.FromBackup is not BackupKind.Full)
                                         {
-                                            Database.DocumentsStorage.Delete(context, lowerId, cmd.Id, expectedChangeVector: null,
-                                                nonPersistentFlags: NonPersistentDocumentFlags.SkipRevisionCreation);
+                                            // delete the document to avoid exception if we put new document in a different collection.
+                                            using (DocumentIdWorker.GetSliceFromId(context, cmd.Id, out Slice lowerId))
+                                            {
+                                                Database.DocumentsStorage.Delete(context, lowerId, cmd.Id, expectedChangeVector: null,
+                                                    nonPersistentFlags: NonPersistentDocumentFlags.SkipRevisionCreation);
+                                            }
                                         }
 
                                         var putResult = Database.DocumentsStorage.Put(context, cmd.Id, null, cmd.Document.Clone(context), changeVector: changeVector,
@@ -711,7 +778,7 @@ namespace Raven.Server.Documents.Handlers
                 return Database.DocumentsStorage.ExtractCollectionName(context, conflicts[0].Collection);
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 return new ClusterTransactionMergedCommandDto
                 {
@@ -755,7 +822,7 @@ namespace Raven.Server.Documents.Handlers
                 return sb.ToString();
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 return new MergedBatchCommandDto
                 {
@@ -805,13 +872,13 @@ namespace Raven.Server.Documents.Handlers
                                     Database.DocumentsStorage.RevisionsStorage.Put(context, existingDocument.Id,
                                                                                    existingDocument.Data.Clone(context),
                                                                                    existingDocument.Flags |= DocumentFlags.HasRevisions,
-                                                                                   nonPersistentFlags: NonPersistentDocumentFlags.None,
+                                                                                   nonPersistentFlags: NonPersistentDocumentFlags.ForceRevisionCreation,
                                                                                    existingDocument.ChangeVector,
                                                                                    existingDocument.LastModified.Ticks);
                                     flags |= DocumentFlags.HasRevisions;
                                 }
 
-                                putResult = Database.DocumentsStorage.Put(context, cmd.Id, cmd.ChangeVector, cmd.Document, 
+                                putResult = Database.DocumentsStorage.Put(context, cmd.Id, cmd.ChangeVector, cmd.Document,
                                     oldChangeVectorForClusterTransactionIndexCheck: cmd.OriginalChangeVector, flags: flags);
                             }
                             catch (Voron.Exceptions.VoronConcurrencyErrorException)
@@ -841,7 +908,7 @@ namespace Raven.Server.Documents.Handlers
 
                         case CommandType.PATCH:
                         case CommandType.BatchPATCH:
-                                cmd.PatchCommand.ExecuteDirectly(context);
+                            cmd.PatchCommand.ExecuteDirectly(context);
 
                             var lastChangeVector = cmd.PatchCommand.HandleReply(Reply, ModifiedCollections);
 
@@ -851,7 +918,7 @@ namespace Raven.Server.Documents.Handlers
                             break;
 
                         case CommandType.JsonPatch:
-                            
+
                             cmd.JsonPatchCommand.ExecuteDirectly(context);
 
                             var lastChangeVectorJsonPatch = cmd.JsonPatchCommand.HandleReply(Reply, ModifiedCollections, Database);
@@ -880,17 +947,7 @@ namespace Raven.Server.Documents.Handlers
 
                             var docId = cmd.Id;
 
-                            if (docId[docId.Length - 1] == Database.IdentityPartsSeparator)
-                            {
-                                // attachment sent by Raven ETL, only prefix is defined
-
-                                if (lastPutResult == null)
-                                    ThrowUnexpectedOrderOfRavenEtlCommands();
-
-                                Debug.Assert(lastPutResult.Value.Id.StartsWith(docId));
-
-                                docId = lastPutResult.Value.Id;
-                            }
+                            EtlGetDocIdFromPrefixIfNeeded(ref docId, cmd, lastPutResult);
 
                             var attachmentPutResult = Database.DocumentsStorage.AttachmentsStorage.PutAttachment(context, docId, cmd.Name,
                                 cmd.ContentType, attachmentStream.Hash, cmd.ChangeVector, stream, updateDocument: false);
@@ -1020,20 +1077,26 @@ namespace Raven.Server.Documents.Handlers
                                 //[nameof(Constants.Fields.CommandData.DocumentChangeVector)] = tsCmd.LastDocumentChangeVector
                             });
 
+                            if (tsCmd.DocCollection != null)
+                                ModifiedCollections?.Add(tsCmd.DocCollection);
+
                             break;
 
                         case CommandType.TimeSeriesCopy:
 
                             var reader = Database.DocumentsStorage.TimeSeriesStorage.GetReader(context, cmd.Id, cmd.Name, cmd.From ?? DateTime.MinValue, cmd.To ?? DateTime.MaxValue);
 
-                            var docCollection = TimeSeriesHandler.ExecuteTimeSeriesBatchCommand.GetDocumentCollection(Database, context, cmd.DestinationId, fromEtl: false);
+                            var destinationDocCollection = TimeSeriesHandler.ExecuteTimeSeriesBatchCommand.GetDocumentCollection(Database, context, cmd.DestinationId, fromEtl: false);
 
                             var cv = Database.DocumentsStorage.TimeSeriesStorage.AppendTimestamp(context,
                                     cmd.DestinationId,
-                                    docCollection,
+                                    destinationDocCollection,
                                     cmd.DestinationName,
-                                    reader.AllValues()
+                                    reader.AllValues(),
+                                    AppendOptionsForTimeSeriesCopy
                                 );
+
+                            LastChangeVector = cv;
 
                             Reply.Add(new DynamicJsonValue
                             {
@@ -1041,6 +1104,9 @@ namespace Raven.Server.Documents.Handlers
                                 [nameof(BatchRequestParser.CommandData.ChangeVector)] = cv,
                                 [nameof(BatchRequestParser.CommandData.Type)] = nameof(CommandType.TimeSeriesCopy),
                             });
+
+                            ModifiedCollections?.Add(destinationDocCollection);
+
                             break;
 
                         case CommandType.Counters:
@@ -1051,7 +1117,7 @@ namespace Raven.Server.Documents.Handlers
                                 Documents = new List<DocumentCountersOperation> { cmd.Counters },
                                 FromEtl = cmd.FromEtl
                             });
-                                counterBatchCmd.ExecuteDirectly(context);
+                            counterBatchCmd.ExecuteDirectly(context);
 
                             LastChangeVector = counterBatchCmd.LastChangeVector;
 
@@ -1063,6 +1129,15 @@ namespace Raven.Server.Documents.Handlers
                                 [nameof(CountersDetail)] = counterBatchCmd.CountersDetail.ToJson(),
                                 [nameof(Constants.Fields.CommandData.DocumentChangeVector)] = counterBatchCmd.LastDocumentChangeVector
                             });
+
+                            if (counterBatchCmd.DocumentCollections != null)
+                            {
+                                foreach (var collection in counterBatchCmd.DocumentCollections)
+                                {
+                                    ModifiedCollections?.Add(collection);
+                                }
+                            }
+
                             break;
 
                         case CommandType.ForceRevisionCreation:
@@ -1103,7 +1178,7 @@ namespace Raven.Server.Documents.Handlers
                             revisionCreated = Database.DocumentsStorage.RevisionsStorage.Put(context, existingDoc.Id,
                                                                                          clonedDocData,
                                                                                          existingDoc.Flags,
-                                                                                         nonPersistentFlags: NonPersistentDocumentFlags.None,
+                                                                                         nonPersistentFlags: NonPersistentDocumentFlags.ForceRevisionCreation,
                                                                                          existingDoc.ChangeVector,
                                                                                          existingDoc.LastModified.Ticks);
                             if (revisionCreated)
@@ -1133,7 +1208,7 @@ namespace Raven.Server.Documents.Handlers
 
                             Reply.Add(forceRevisionReply);
                             break;
-                        
+
                     }
                 }
 
@@ -1161,9 +1236,9 @@ namespace Raven.Server.Documents.Handlers
 
             private void EtlGetDocIdFromPrefixIfNeeded(ref string docId, BatchRequestParser.CommandData cmd, DocumentsStorage.PutOperationResults? lastPutResult)
             {
-                if (!cmd.FromEtl || docId[^1] != Database.IdentityPartsSeparator)
+                if (cmd.FromEtl == false || docId[^1] != Database.IdentityPartsSeparator)
                     return;
-                // counter/time-series sent by Raven ETL, only prefix is defined
+                // counter/time-series/attachments sent by Raven ETL, only prefix is defined
 
                 if (lastPutResult == null)
                     ThrowUnexpectedOrderOfRavenEtlCommands();
@@ -1244,12 +1319,12 @@ namespace Raven.Server.Documents.Handlers
                     patch: (ParsedCommands[i].Patch, ParsedCommands[i].PatchArgs),
                     patchIfMissing: (ParsedCommands[i].PatchIfMissing, ParsedCommands[i].PatchIfMissingArgs),
                     database: database,
-                    createIfMissing:ParsedCommands[i].CreateIfMissing,
+                    createIfMissing: ParsedCommands[i].CreateIfMissing,
                     isTest: false,
                     debugMode: false,
                     collectResultsNeeded: true,
                     returnDocument: ParsedCommands[i].ReturnDocument
-                    
+
                 );
             }
 

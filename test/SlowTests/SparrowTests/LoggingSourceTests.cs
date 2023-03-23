@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using FastTests;
+using Raven.Client.Extensions;
 using Sparrow;
 using Sparrow.Logging;
 using Voron.Global;
@@ -96,15 +97,23 @@ namespace SlowTests.SparrowTests
                 Assert.All(toCheckLogFiles, toCheck =>
                 {
                     (string fileName, bool shouldExist) = toCheck;
-                    fileName = $"{fileName}{(compressing ? ".gz" : string.Empty)}";
-                    var fileInfo = new FileInfo(fileName);
+                    var found = Directory.GetFiles(path, Path.GetFileName(fileName) + '*');
                     if (shouldExist)
                     {
-                        Assert.True(fileInfo.Exists, $"The log file \"{fileInfo.Name}\" should be exist");
+                        Assert.True(found.Any(), $"The log file \"{fileName}\" should be exist");
                     }
                     else
                     {
-                        Assert.False(fileInfo.Exists, $"The log file \"{fileInfo.Name}\" last modified {fileInfo.LastWriteTime} should not be exist. retentionTime({retentionTime})");
+                        Assert.False(found.Any(), CreateErrorMessage());
+                        string CreateErrorMessage()
+                        {
+                            var messages = found.Select(f =>
+                            {
+                                var fileInfo = new FileInfo(found.First());
+                                return fileInfo.Exists ? $"\"{fileInfo.Name}\" last modified {fileInfo.LastWriteTime}" : string.Empty;
+                            });
+                            return $"The log files {string.Join(", ", messages)} should not be exist. retentionTime({retentionTime})";
+                        }
                     }
                 });
             }
@@ -345,8 +354,6 @@ namespace SlowTests.SparrowTests
                 return Math.Abs(size - retentionSize) <= threshold;
             }, true, 10_000, 1_000);
 
-            loggingSource.EndLogging();
-
             string errorMessage = isRetentionPolicyApplied 
                 ? string.Empty
                 : $"{TempInfoToInvestigate(loggingSource, path)}. " +
@@ -354,6 +361,8 @@ namespace SlowTests.SparrowTests
                   Environment.NewLine + 
                   FileNamesWithSize(afterEndFiles);
 
+            loggingSource.EndLogging();
+            
             Assert.True(isRetentionPolicyApplied, errorMessage);
         }
 
@@ -373,7 +382,7 @@ namespace SlowTests.SparrowTests
                 var logs = logDirectory.GetFiles();
                 foreach (var fileInfo in logs)
                 {
-                    using var file = fileInfo.OpenRead();
+                    using var file = fileInfo.Open(FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
 
                     Stream stream;
                     if (fileInfo.Name.EndsWith(".log.gz"))
@@ -514,8 +523,7 @@ namespace SlowTests.SparrowTests
                     for (var i = 0; i < 100; i++)
                     {
                         var task = secondLogger.OperationsWithWait("Some message");
-                        Task.WhenAny(task, Task.Delay(taskTimeout)).GetAwaiter().GetResult();
-                        if (task.IsCompleted == false)
+                        if (task.WaitWithTimeout(TimeSpan.FromMilliseconds(taskTimeout)).GetAwaiter().GetResult() == false)
                             throw new TimeoutException($"The log task took more then one second");
                     }
                 }
@@ -569,7 +577,7 @@ namespace SlowTests.SparrowTests
 
             var logger = new Logger(loggingSource, "Source" + name, "Logger" + name);
             var tcs = new TaskCompletionSource<WebSocketReceiveResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var socket = new DummyWebSocket();
+            var socket = new MyDummyWebSocket();
             socket.ReceiveAsyncFunc = () => tcs.Task;
             var context = new LoggingSource.WebSocketContext();
 
@@ -713,7 +721,7 @@ namespace SlowTests.SparrowTests
 
             var logger = new Logger(loggingSource, "Source" + name, "Logger" + name);
             var tcs = new TaskCompletionSource<WebSocketReceiveResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var socket = new DummyWebSocket();
+            var socket = new MyDummyWebSocket();
             socket.ReceiveAsyncFunc = () => tcs.Task;
             var context = new LoggingSource.WebSocketContext();
 
@@ -739,7 +747,7 @@ namespace SlowTests.SparrowTests
             Assert.DoesNotContain(uniqForInformation, logContent);
         }
 
-        private class DummyWebSocket : WebSocket
+        private class MyDummyWebSocket : WebSocket
         {
             private bool _close;
             public string LogsReceived { get; private set; } = "";

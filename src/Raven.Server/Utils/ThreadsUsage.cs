@@ -25,7 +25,22 @@ namespace Raven.Server.Utils
                 {
                     using (thread)
                     {
-                        _threadTimesInfo[thread.Id] = thread.TotalProcessorTime.Ticks;
+                        try
+                        {
+                            _threadTimesInfo[thread.Id] = thread.TotalProcessorTime.Ticks;
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            // thread has exited
+                        }
+                        catch (Win32Exception e) when (e.NativeErrorCode == 0x5)
+                        {
+                            // thread has exited
+                        }
+                        catch (NotSupportedException)
+                        {
+                            // nothing to do
+                        }
                     }
                 }
 
@@ -33,13 +48,13 @@ namespace Raven.Server.Utils
             }
         }
 
-        public ThreadsInfo Calculate(HashSet<int> threadIds = null)
+        public ThreadsInfo Calculate(int? take = null, HashSet<int> threadIds = null)
         {
             var threadAllocations = NativeMemory.AllThreadStats
                         .GroupBy(x => x.UnmanagedThreadId)
                         .ToDictionary(g => g.Key, x => x.First());
 
-            var threadsInfo = new ThreadsInfo();
+            var threadsInfo = new ThreadsInfo(take);
 
             using (var process = Process.GetCurrentProcess())
             {
@@ -53,8 +68,8 @@ namespace Raven.Server.Utils
                 if (timeDiff == 0 || activeCores == 0)
                     return threadsInfo;
 
-                var cpuUsage = (processorTimeDiff * 100.0) / timeDiff / activeCores;
-                cpuUsage = Math.Min(cpuUsage, 100);
+                var processCpuUsage = (processorTimeDiff * 100.0) / timeDiff / activeCores;
+                processCpuUsage = Math.Min(processCpuUsage, 100);
 
                 var threadTimesInfo = new Dictionary<int, long>();
                 double totalCpuUsage = 0;
@@ -70,7 +85,7 @@ namespace Raven.Server.Utils
                         try
                         {
                             var threadTotalProcessorTime = thread.TotalProcessorTime;
-                            var threadCpuUsage = GetThreadCpuUsage(thread.Id, threadTotalProcessorTime, processorTimeDiff, cpuUsage, activeCores);
+                            var threadCpuUsage = GetThreadCpuUsage(thread.Id, threadTotalProcessorTime, processorTimeDiff, processCpuUsage);
                             threadTimesInfo[thread.Id] = threadTotalProcessorTime.Ticks;
                             if (threadCpuUsage == null)
                             {
@@ -131,7 +146,7 @@ namespace Raven.Server.Utils
 
                 _threadTimesInfo = threadTimesInfo;
                 threadsInfo.CpuUsage = Math.Min(totalCpuUsage, 100);
-
+                threadsInfo.ProcessCpuUsage = processCpuUsage;
                 return threadsInfo;
             }
         }
@@ -160,7 +175,7 @@ namespace Raven.Server.Utils
             }
         }
 
-        private double? GetThreadCpuUsage(int threadId, TimeSpan threadTotalProcessorTime, long processorTimeDiff, double cpuUsage, long activeCores)
+        private double? GetThreadCpuUsage(int threadId, TimeSpan threadTotalProcessorTime, long processorTimeDiff, double processCpuUsage)
         {
             if (_threadTimesInfo.TryGetValue(threadId, out var previousTotalProcessorTimeTicks) == false)
             {
@@ -175,16 +190,7 @@ namespace Raven.Server.Utils
                 return 0;
             }
 
-            var threadCpuUsage = threadTimeDiff * 1.0 / processorTimeDiff * cpuUsage;
-
-            if (PlatformDetails.RunningOnLinux)
-            {
-                // we need to divide the result by the number of cores since
-                // a .net thread is a process in linux
-                threadCpuUsage /= activeCores;
-            }
-
-            return threadCpuUsage;
+            return threadTimeDiff * 1.0 / processorTimeDiff * processCpuUsage;
         }
     }
 }

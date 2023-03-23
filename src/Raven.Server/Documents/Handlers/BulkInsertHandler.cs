@@ -229,7 +229,6 @@ namespace Raven.Server.Documents.Handlers
             }
 
             using (Database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext ctx))
-            using (ctx.OpenWriteTransaction())
             {
                 attachmentStream.Hash = await AttachmentsStorageHelper.CopyStreamToFileAndCalculateHash(ctx, stream, attachmentStream.Stream, Database.DatabaseShutdown);
                 await attachmentStream.Stream.FlushAsync();
@@ -462,7 +461,7 @@ namespace Raven.Server.Documents.Handlers
                 return NumberOfCommands;
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 return new MergedInsertBulkCommandDto
                 {

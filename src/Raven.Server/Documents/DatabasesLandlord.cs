@@ -6,7 +6,6 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Nito.AsyncEx;
-using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Database;
 using Raven.Client.Extensions;
 using Raven.Client.ServerWide;
@@ -80,9 +79,13 @@ namespace Raven.Server.Documents
         internal class TestingStuff
         {
             internal Action<ServerStore> BeforeHandleClusterDatabaseChanged;
+            internal Action<string> InsideHandleClusterDatabaseChanged;
             internal Action<(DocumentDatabase Database, string caller)> AfterDatabaseCreation;
+            internal Action<CancellationToken> DelayIncomingReplication;
             internal int? HoldDocumentDatabaseCreation = null;
+            internal Action AfterDatabaseInitialize;
             internal bool PreventedRehabOfIdleDatabase = false;
+            internal ManualResetEvent DeleteDatabaseWhileItBeingDeleted = null;
             internal Action<DocumentDatabase> OnBeforeDocumentDatabaseInitialization;
             internal ManualResetEventSlim RescheduleDatabaseWakeupMre = null;
         }
@@ -115,7 +118,7 @@ namespace Raven.Server.Documents
                             return;
                         }
 
-
+                        ForTestingPurposes?.InsideHandleClusterDatabaseChanged?.Invoke(type);
                         if (ShouldDeleteDatabase(context, databaseName, rawRecord))
                             return;
 
@@ -338,6 +341,7 @@ namespace Raven.Server.Documents
                 catch (AggregateException ae) when (nameof(DeleteDatabase).Equals(ae.InnerException.Data["Source"]))
                 {
                     // this is already in the process of being deleted, we can just exit and let another thread handle it
+                    ForTestingPurposes?.DeleteDatabaseWhileItBeingDeleted?.Set();
                     return;
                 }
                 catch (DatabaseConcurrentLoadTimeoutException e)
@@ -557,7 +561,7 @@ namespace Raven.Server.Documents
             return false;
         }
 
-        public Task<DocumentDatabase> TryGetOrCreateResourceStore(StringSegment databaseName, DateTime? wakeup = null, bool ignoreDisabledDatabase = false, bool ignoreBeenDeleted = false, bool ignoreNotRelevant = false, [CallerMemberName] string caller = null)
+        public Task<DocumentDatabase> TryGetOrCreateResourceStore(StringSegment databaseName, DateTime? wakeup = null, bool ignoreDisabledDatabase = false, bool ignoreBeenDeleted = false, bool ignoreNotRelevant = false, Action<string> addToInitLog = null, [CallerMemberName] string caller = null)
         {
             IDisposable release = null;
             try
@@ -574,14 +578,13 @@ namespace Raven.Server.Documents
                     {
                         // If a database was unloaded, this is what we get from DatabasesCache.
                         // We want to keep the exception there until UnloadAndLockDatabase is disposed.
-                        var extractSingleInnerException = database.Exception.ExtractSingleInnerException();
-                        if (Equals(extractSingleInnerException.Data[DoNotRemove], true))
+                        if (IsLockedDatabase(database.Exception))
                             return database;
                     }
 
                     if (database.IsFaulted || database.IsCanceled)
                     {
-                        DatabasesCache.TryRemove(databaseName, out database);
+                        DatabasesCache.TryRemove(databaseName, database);
                         LastRecentlyUsed.TryRemove(databaseName, out var _);
                         // and now we will try creating it again
                     }
@@ -593,12 +596,20 @@ namespace Raven.Server.Documents
                         return database;
                     }
                 }
-                return CreateDatabase(databaseName, wakeup, ignoreDisabledDatabase, ignoreBeenDeleted, ignoreNotRelevant, caller);
+                return CreateDatabase(databaseName, wakeup, ignoreDisabledDatabase, ignoreBeenDeleted, ignoreNotRelevant, caller, addToInitLog);
             }
             finally
             {
                 release?.Dispose();
             }
+        }
+
+        internal static bool IsLockedDatabase(AggregateException exception)
+        {
+            if (exception == null)
+                return false;
+            var extractSingleInnerException = exception.ExtractSingleInnerException();
+            return Equals(extractSingleInnerException.Data[DoNotRemove], true);
         }
 
         private IDisposable EnterReadLockImmediately(StringSegment databaseName)
@@ -635,7 +646,7 @@ namespace Raven.Server.Documents
             throw new ObjectDisposedException("The server is being disposed, cannot load database " + databaseName);
         }
 
-        private Task<DocumentDatabase> CreateDatabase(StringSegment databaseName, DateTime? wakeup, bool ignoreDisabledDatabase, bool ignoreBeenDeleted, bool ignoreNotRelevant, string caller)
+        private Task<DocumentDatabase> CreateDatabase(StringSegment databaseName, DateTime? wakeup, bool ignoreDisabledDatabase, bool ignoreBeenDeleted, bool ignoreNotRelevant, string caller, Action<string> addToInitLog = null)
         {
             var config = CreateDatabaseConfiguration(databaseName, ignoreDisabledDatabase, ignoreBeenDeleted, ignoreNotRelevant);
             if (config == null)
@@ -644,7 +655,7 @@ namespace Raven.Server.Documents
             if (!_databaseSemaphore.Wait(0))
                 return UnlikelyCreateDatabaseUnderContention(databaseName, config, wakeup, caller);
 
-            return CreateDatabaseUnderResourceSemaphore(databaseName, config, wakeup, caller);
+            return CreateDatabaseUnderResourceSemaphore(databaseName, config, wakeup, addToInitLog, caller);
         }
 
         private async Task<DocumentDatabase> UnlikelyCreateDatabaseUnderContention(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup = null, string caller = null)
@@ -655,11 +666,11 @@ namespace Raven.Server.Documents
             return await CreateDatabaseUnderResourceSemaphore(databaseName, config, wakeup);
         }
 
-        private Task<DocumentDatabase> CreateDatabaseUnderResourceSemaphore(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup = null, string caller = null)
+        private Task<DocumentDatabase> CreateDatabaseUnderResourceSemaphore(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup = null, Action<string> addToInitLog = null, string caller = null)
         {
             try
             {
-                var task = new Task<DocumentDatabase>(() => ActuallyCreateDatabase(databaseName, config, wakeup), TaskCreationOptions.RunContinuationsAsynchronously);
+                var task = new Task<DocumentDatabase>(() => ActuallyCreateDatabase(databaseName, config, wakeup, addToInitLog), TaskCreationOptions.RunContinuationsAsynchronously);
                 var database = DatabasesCache.GetOrAdd(databaseName, task);
                 if (database == task)
                 {
@@ -688,7 +699,7 @@ namespace Raven.Server.Documents
             }
         }
 
-        private DocumentDatabase ActuallyCreateDatabase(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup = null)
+        private DocumentDatabase ActuallyCreateDatabase(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup = null, Action<string> addToInitLog = null)
         {
             IDisposable release = null;
             try
@@ -699,7 +710,7 @@ namespace Raven.Server.Documents
                 //if false, this means we have started disposing, so we shouldn't create a database now
                 release = EnterReadLockImmediately(databaseName);
 
-                var db = CreateDocumentsStorage(databaseName, config, wakeup);
+                var db = CreateDocumentsStorage(databaseName, config, wakeup, addToInitLog);
                 _serverStore.NotificationCenter.Add(
                     DatabaseChanged.Create(databaseName.Value, DatabaseChangeType.Load));
 
@@ -758,10 +769,11 @@ namespace Raven.Server.Documents
         public ConcurrentDictionary<string, ConcurrentQueue<string>> InitLog =
             new ConcurrentDictionary<string, ConcurrentQueue<string>>(StringComparer.OrdinalIgnoreCase);
 
-        private DocumentDatabase CreateDocumentsStorage(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup = null)
+        private DocumentDatabase CreateDocumentsStorage(StringSegment databaseName, RavenConfiguration config, DateTime? wakeup, Action<string> addToInitLog)
         {
             void AddToInitLog(string txt)
             {
+                addToInitLog?.Invoke(txt);
                 string msg = txt;
                 msg = $"[Load Database] {DateTime.UtcNow} :: Database '{databaseName}' : {msg}";
                 if (InitLog.TryGetValue(databaseName.Value, out var q))
@@ -790,6 +802,8 @@ namespace Raven.Server.Documents
                 ForTestingPurposes?.OnBeforeDocumentDatabaseInitialization?.Invoke(documentDatabase);
 
                 documentDatabase.Initialize(InitializeOptions.None, wakeup);
+
+                ForTestingPurposes?.AfterDatabaseInitialize?.Invoke();
 
                 AddToInitLog("Finish database initialization");
                 DeleteDatabaseCachedInfo(documentDatabase.Name, throwOnError: false);
@@ -926,33 +940,34 @@ namespace Raven.Server.Documents
             return maxLastWork.AddMilliseconds(dbSize / 1024L);
         }
 
-        public async Task<IDisposable> UnloadAndLockDatabase(string dbName, string reason)
+        public Task<IDisposable> UnloadAndLockDatabase(string dbName, string reason)
         {
-            var tcs = Task.FromException<DocumentDatabase>(new DatabaseDisabledException($"The database {dbName} is currently locked because {reason}")
+            return UnloadAndLockDatabaseImpl(DatabasesCache, dbName, CompleteDatabaseUnloading, reason);
+        }
+
+        internal static async Task<IDisposable> UnloadAndLockDatabaseImpl<T>(ResourceCache<T> resourceCache, string dbName, Action<T> unloadDatabaseOnSuccess, string reason)
+        {
+            while (true)
             {
-                Data =
+                try
                 {
-                    [DoNotRemove] = true
+                    return resourceCache.RemoveLockAndReturn(dbName, unloadDatabaseOnSuccess, out _, caller: null, reason: reason);
                 }
-            });
-
-            var t = tcs.IgnoreUnobservedExceptions();
-
-            try
-            {
-                var existing = DatabasesCache.Replace(dbName, tcs);
-                if (existing != null)
-                    (await existing)?.Dispose();
-
-                return new DisposableAction(() =>
+                catch (DatabaseConcurrentLoadTimeoutException)
                 {
-                    DatabasesCache.TryRemove(dbName, out var _);
-                });
-            }
-            catch (Exception)
-            {
-                DatabasesCache.TryRemove(dbName, out var _);
-                throw;
+                    // database is still being loaded
+
+                    await Task.Delay(100);
+                }
+                catch (AggregateException ea)
+                {
+                    var inner = ea.ExtractSingleInnerException();
+
+                    if (inner is DatabaseDisabledException)
+                        throw inner;
+
+                    throw;
+                }
             }
         }
 
@@ -1067,9 +1082,9 @@ namespace Raven.Server.Documents
                                       _logger.Info($"Failed to start database '{name}' on timer, will retry the wakeup in '{_dueTimeOnRetry}' ms", e);
 
                                   RescheduleDatabaseWakeup(name, milliseconds: _dueTimeOnRetry, wakeup);
-                }
+                              }
                           }, TaskContinuationOptions.OnlyOnFaulted);
-            }
+                }
             }
             catch
             {

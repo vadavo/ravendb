@@ -6,13 +6,12 @@ import virtualColumn = require("widgets/virtualGrid/columns/virtualColumn");
 import sortableVirtualColumn = require("widgets/virtualGrid/columns/sortableVirtualColumn");
 import virtualGridConfig = require("widgets/virtualGrid/virtualGridConfig");
 import actionColumn = require("widgets/virtualGrid/columns/actionColumn");
-import hyperlinkColumn = require("widgets/virtualGrid/columns/hyperlinkColumn");
 import virtualGridController = require("widgets/virtualGrid/virtualGridController");
 import virtualGridUtils = require("widgets/virtualGrid/virtualGridUtils");
 import virtualGridSelection = require("widgets/virtualGrid/virtualGridSelection");
 import shiftSelectionPreview = require("widgets/virtualGrid/shiftSelectionPreview");
 
-class virtualGrid<T> {
+class virtualGrid<T extends object> {
     
     static readonly rowHeightRegular = 36;
     static readonly rowHeightCondensed = 24;
@@ -36,8 +35,8 @@ class virtualGrid<T> {
     private columns = ko.observableArray<virtualColumn>();
     private isGridVisible = false;
     private selectionDiff: number[] = [];
-    private inIncludeSelectionMode: boolean = true;
-    private generation: number = 1; // used for concurrency control 
+    private inIncludeSelectionMode = true;
+    private generation = 1; // used for concurrency control 
     
     private sortByColumn = ko.observable<sortableVirtualColumn>();
     private sortMode = ko.observable<sortMode>("asc");
@@ -98,7 +97,7 @@ class virtualGrid<T> {
             findRowForCell: cell => this.findRowForCell(cell),
             headerVisible: v => this.settings.showHeader(v),
             init: (fetcher, columnsProvider) => this.init(fetcher, columnsProvider),
-            reset: (hard: boolean = true, retainSort: boolean = true) => this.resetItems(hard, retainSort),
+            reset: (hard = true, retainSort = true) => this.resetItems(hard, retainSort),
             selection: this.selection,
             customRowClassProvider: provider => this.customRowClassProvider = provider,
             findItem: (predicate) => this.findItem(predicate),
@@ -568,6 +567,7 @@ class virtualGrid<T> {
         return (containerWidth * parseFloat(woPercentage) / 100) + 'px';
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     private chunkFetched(results: pagedResult<T>, skip: number, take: number) {
 
         if (results.totalResultCount === -1) {
@@ -602,7 +602,6 @@ class virtualGrid<T> {
         const oldTotalCount = this.items.size;
         this.totalItemCount = results.totalResultCount;
         this.virtualHeight(results.totalResultCount * this.rowHeight);
-        const endIndex = skip + results.items.length;
         for (let i = 0; i < results.items.length; i++) {
             const rowIndex = i + skip;
             if (!this.items.has(rowIndex)) { // newer override existing items, to avoid issues with selected items and jumps
@@ -943,7 +942,12 @@ class virtualGrid<T> {
                 template: `
 <div class="virtual-grid flex-window stretch" data-bind="attr: { id: gridId }, css: { condensed : condensed }">
     <div class="absolute-center loading" data-bind="visible: isLoading"><div class="global-spinner"></div></div>
-    <div class="column-container flex-window-head" data-bind="foreach: columns, visible: settings.showHeader"><div class="column" data-bind="style: { width: $data.width }, attr: { title: $data.headerTitle }, css: { sortable: sortable, asc: $data === $parent.sortByColumn() && $parent.sortMode() === 'asc', desc: $data === $parent.sortByColumn() && $parent.sortMode() === 'desc' }"><div class="sortable-controls"></div><strong data-bind="html: $data.header"></strong></div></div>    
+    <div class="column-container flex-window-head" data-bind="foreach: columns, visible: settings.showHeader">
+        <div class="column" data-bind="style: { width: $data.width }, attr: { title: $data.headerTitle }, css: { sortable: sortable, asc: $data === $parent.sortByColumn() && $parent.sortMode() === 'asc', desc: $data === $parent.sortByColumn() && $parent.sortMode() === 'desc' }">
+            <div class="sortable-controls"></div>
+            <strong data-bind="html: $data.header"></strong>
+        </div>
+    </div>    
     <div class="viewport flex-window-scroll" data-bind="css: { 'header-visible': settings.showHeader }">
         <div class="viewport-scroller" data-bind="style: { height: virtualHeight() + 'px', width: virtualWidth() + 'px' }, template: { afterRender: afterRender.bind($data) }">
         </div>

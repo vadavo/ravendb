@@ -1,4 +1,5 @@
 using System;
+using Raven.Client.Documents.Operations.Backups;
 using Sparrow;
 using Sparrow.Logging;
 using Sparrow.Server.Utils;
@@ -9,7 +10,7 @@ namespace Raven.Server.Documents.PeriodicBackup
     {
         public static void AssertFreeSpaceForSnapshot(string directoryPath, long sizeInBytes, string action, Logger logger)
         {
-            var destinationDriveInfo = DiskSpaceChecker.GetDiskSpaceInfo(directoryPath);
+            var destinationDriveInfo = DiskUtils.GetDiskSpaceInfo(directoryPath);
             if (destinationDriveInfo == null)
             {
                 if (logger.IsInfoEnabled)
@@ -22,6 +23,11 @@ namespace Raven.Server.Documents.PeriodicBackup
             if (destinationDriveInfo.TotalFreeSpace < desiredFreeSpace)
                 throw new InvalidOperationException($"Not enough free space to {action}. " +
                                                     $"Required space {desiredFreeSpace}, available space: {destinationDriveInfo.TotalFreeSpace}");
+        }
+
+        public static bool BackupTypeChanged(PeriodicBackupConfiguration previous, PeriodicBackupConfiguration current)
+        {
+            return previous.BackupType != current.BackupType;
         }
     }
 }

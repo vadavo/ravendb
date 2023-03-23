@@ -16,6 +16,8 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Indexes.Spatial;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Exceptions.Documents.Indexes;
+using Raven.Client.Extensions;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
 using Raven.Server.Config.Categories;
@@ -253,6 +255,9 @@ namespace Raven.Server.Documents.Indexes
         private readonly double _txAllocationsRatio;
 
         private readonly string _itemType;
+        
+        internal bool SourceDocumentIncludedInOutput;
+        private bool _alreadyNotifiedAboutIncludingDocumentInOutput;
 
         protected Index(IndexType type, IndexSourceType sourceType, IndexDefinitionBaseServerSide definition)
         {
@@ -652,7 +657,7 @@ namespace Raven.Server.Documents.Indexes
             var indexPath = configuration.StoragePath.Combine(name);
 
             var indexTempPath = configuration.TempPath?.Combine(name);
-
+            
             var options = configuration.RunInMemory
                 ? StorageEnvironmentOptions.CreateMemoryOnly(indexPath.FullPath, indexTempPath?.FullPath ?? Path.Combine(indexPath.FullPath, "Temp"),
                     documentDatabase.IoChanges, documentDatabase.CatastrophicFailureNotification)
@@ -695,6 +700,16 @@ namespace Raven.Server.Documents.Indexes
             {
                 options.SchemaVersion = SchemaUpgrader.CurrentVersion.IndexVersion;
                 options.SchemaUpgrader = SchemaUpgrader.Upgrader(SchemaUpgrader.StorageType.Index, null, null, null);
+            }
+
+            if (options is not StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions) 
+                return;
+            
+            string disableMarkerPath = options.BasePath.Combine("disable.marker").FullPath;
+            if (File.Exists(disableMarkerPath))
+            {
+                throw new IndexOpenException(
+                    $"Unable to open index: '{name}', it has been manually disabled via the file: '{disableMarkerPath}'. To re-enable, remove the disable.marker file and enable indexing.");
             }
         }
 
@@ -1896,11 +1911,11 @@ namespace Raven.Server.Documents.Indexes
                     throw new NotSupportedException($"Unknown priority: {priority}");
             }
 
-            var currentPriority = Thread.CurrentThread.Priority;
+            var currentPriority = ThreadHelper.GetThreadPriority();
             if (currentPriority == newPriority)
                 return;
 
-            Thread.CurrentThread.Priority = newPriority;
+            ThreadHelper.TrySetThreadPriority(newPriority, IndexingThreadName, _logger);
         }
 
         private void PersistIndexDefinition()
@@ -2087,6 +2102,11 @@ namespace Raven.Server.Documents.Indexes
                     Task.Delay((int)timeLeft, _indexingProcessCancellationTokenSource.Token).Wait();
             }
             catch (OperationCanceledException)
+            {
+                // index was deleted or database was shutdown
+                return;
+            }
+            catch (AggregateException ae) when (ae.ExtractSingleInnerException() is OperationCanceledException)
             {
                 // index was deleted or database was shutdown
                 return;
@@ -2437,7 +2457,17 @@ namespace Raven.Server.Documents.Indexes
                 if (Type == IndexType.Faulty)
                     return 1;
 
-                return _indexStorage.ReadErrorsCount();
+                try
+                {
+                    return _indexStorage.ReadErrorsCount();
+                }
+                catch (Exception e)
+                {
+                    if (_logger.IsOperationsEnabled)
+                        _logger.Operations("Failed to get index error count", e);
+
+                    return 1;
+                }
             }
         }
 
@@ -2826,7 +2856,8 @@ namespace Raven.Server.Documents.Indexes
             return (lastDocumentEtag, lastTombstoneEtag);
         }
 
-        public virtual IndexStats GetStats(bool calculateLag = false, bool calculateStaleness = false, bool calculateMemoryStats = false,
+        public virtual IndexStats GetStats(bool calculateLag = false, bool calculateStaleness = false,
+            bool calculateMemoryStats = false, bool calculateLastBatchStats = false,
             QueryOperationContext queryContext = null)
         {
             using (CurrentlyInUse(out var valid))
@@ -2865,7 +2896,9 @@ namespace Raven.Server.Documents.Indexes
                     stats.MappedPerSecondRate = MapsPerSec?.OneMinuteRate ?? 0;
                     stats.ReducedPerSecondRate = ReducesPerSec?.OneMinuteRate ?? 0;
 
-                    stats.LastBatchStats = _lastStats?.ToIndexingPerformanceLiveStats();
+                    if (calculateLastBatchStats)
+                        stats.LastBatchStats = _lastStats?.ToIndexingPerformanceLiveStats();
+                    
                     stats.LastQueryingTime = _lastQueryingTime;
 
                     if (Type == IndexType.MapReduce || Type == IndexType.JavaScriptMapReduce)
@@ -3098,7 +3131,7 @@ namespace Raven.Server.Documents.Indexes
 
                         FillQueryResult(resultToFill, isStale, query.Metadata, queryContext, indexContext);
 
-                        using (var reader = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction))
+                        using (var reader = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction, query))
                         {
                             using (var queryScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Query)))
                             {
@@ -3715,14 +3748,14 @@ namespace Raven.Server.Documents.Indexes
 
         private void ThrowCompactionInProgress()
         {
-            throw new InvalidOperationException($"Index '{Name}' is currently being compacted.");
+            throw new IndexCompactionInProgressException($"Index '{Name}' is currently being compacted.");
         }
 
         private void AssertQueryDoesNotContainFieldsThatAreNotIndexed(QueryMetadata metadata)
         {
             foreach (var field in metadata.IndexFieldNames)
             {
-                AssertKnownField(field);
+                AssertKnownField(field, metadata.IndexName);
             }
 
             if (metadata.OrderBy != null)
@@ -3742,24 +3775,24 @@ namespace Raven.Server.Documents.Indexes
                         continue;
 #endif
 
-                    AssertKnownField(f);
+                    AssertKnownField(f, metadata.IndexName);
                 }
             }
         }
 
-        private void AssertKnownField(string f)
+        private void AssertKnownField(string f, string indexName)
         {
             // the catch all field name means that we have dynamic fields names
 
             if (Definition.HasDynamicFields || IndexPersistence.ContainsField(f))
                 return;
 
-            ThrowInvalidField(f);
+            ThrowInvalidField(f, indexName);
         }
 
-        private static void ThrowInvalidField(string f)
+        private static void ThrowInvalidField(string f, string indexName)
         {
-            throw new ArgumentException($"The field '{f}' is not indexed, cannot query/sort on fields that are not indexed");
+            throw new ArgumentException($"The field '{f}' is not indexed for index '{indexName}', cannot query/sort on fields that are not indexed");
         }
 
         private void FillFacetedQueryResult(FacetedQueryResult result, bool isStale, long facetSetupEtag, QueryMetadata q,
@@ -4095,7 +4128,23 @@ namespace Raven.Server.Documents.Indexes
             IncludeDocumentsCommand includeDocumentsCommand, IncludeCompareExchangeValuesCommand includeCompareExchangeValuesCommand, IncludeRevisionsCommand includeRevisionsCommand);
 
         public abstract void SaveLastState();
-
+        
+        protected void HandleSourceDocumentIncludedInMapOutput()
+        {
+            if (_alreadyNotifiedAboutIncludingDocumentInOutput || SourceDocumentIncludedInOutput == false || PerformanceHintsConfig.AlertWhenSourceDocumentIncludedInOutput == false)
+                return;
+            
+            DocumentDatabase.NotificationCenter.Add(PerformanceHint.Create(
+                DocumentDatabase.Name,
+                $"Index '{Name}' is including the origin document in output.",
+                $"Putting the whole document as one of the fields of the index entry isn't usually intentional. Especially when it is a fanout index because the document is included multiple times. Please verify your index definition for better indexing performance.",
+                PerformanceHintType.Indexing,
+                NotificationSeverity.Warning,
+                nameof(Index)));
+            
+            _alreadyNotifiedAboutIncludingDocumentInOutput = true;
+        }
+        
         protected void HandleIndexOutputsPerDocument(LazyStringValue documentId, int numberOfOutputs, IndexingStatsScope stats)
         {
             stats.RecordNumberOfProducedOutputs(numberOfOutputs);
@@ -4256,7 +4305,7 @@ namespace Raven.Server.Documents.Indexes
 
             if (parameters.Sw.Elapsed > maxTimeForDocumentTransactionToRemainOpen)
             {
-                if (parameters.QueryContext.Documents.ShouldRenewTransactionsToAllowFlushing())
+                if (parameters.QueryContext.Documents.ShouldRenewTransactionsToAllowFlushing() || _forTestingPurposes is { ShouldRenewTransaction: true })
                     return CanContinueBatchResult.RenewTransaction;
 
                 // if we haven't had writes in the meantime, there is no point
@@ -4403,6 +4452,7 @@ namespace Raven.Server.Documents.Indexes
                     ref _currentMaximumAllowedMemory,
                     allocated,
                     _environment.Options.RunningOn32Bits,
+                    DocumentDatabase.ServerStore.Server.MetricCacher,
                     _logger,
                     out var memoryUsage) == false)
                 {
@@ -4560,11 +4610,10 @@ namespace Raven.Server.Documents.Indexes
                     _logger.Info($"{Name} is still waiting for other indexes to complete their batches because there is a {reason} condition in action...");
             }
         }
-
-        public void Compact(Action<IOperationProgress> onProgress, CompactionResult result, CancellationToken token)
+        
+        public void Compact(Action<IOperationProgress> onProgress, CompactionResult result, bool shouldSkipOptimization, CancellationToken token)
         {
-            if (_isCompactionInProgress)
-                throw new InvalidOperationException($"Index '{Name}' cannot be compacted because compaction is already in progress.");
+            AssertCompactionOrOptimizationIsNotInProgress(Name, nameof(Compact));
 
             result.SizeBeforeCompactionInMb = CalculateIndexStorageSize().GetValue(SizeUnit.Megabytes);
 
@@ -4589,9 +4638,19 @@ namespace Raven.Server.Documents.Indexes
                 try
                 {
                     var storageEnvironmentOptions = _environment.Options;
-
-                    using (RestartEnvironment(onBeforeEnvironmentDispose: Optimize))
+                    
+                    using (RestartEnvironment(onBeforeEnvironmentDispose: () =>
+                           {
+                               if (shouldSkipOptimization) 
+                                   return;
+                               
+                               result.AddMessage($"Starting data optimization of index '{Name}'.");
+                               onProgress?.Invoke(result.Progress);
+                               OptimizeInternal(token);
+                           }))
                     {
+                        DocumentDatabase.IndexStore?.ForTestingPurposes?.IndexCompaction?.Invoke();
+
                         if (Type.IsMapReduce())
                         {
                             result.AddMessage($"Skipping data compaction of '{Name}' index because data compaction of map-reduce indexes isn't supported");
@@ -4602,8 +4661,7 @@ namespace Raven.Server.Documents.Indexes
                             return;
                         }
 
-                        var environmentOptions =
-                                                (StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)storageEnvironmentOptions;
+                        var environmentOptions = (StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)storageEnvironmentOptions;
                         var srcOptions = StorageEnvironmentOptions.ForPath(environmentOptions.BasePath.FullPath, environmentOptions.TempPath?.FullPath, null, DocumentDatabase.IoChanges,
                             DocumentDatabase.CatastrophicFailureNotification);
 
@@ -4656,26 +4714,61 @@ namespace Raven.Server.Documents.Indexes
 
                     _isCompactionInProgress = false;
                 }
-
-                void Optimize()
-                {
-                    result.AddMessage($"Starting data optimization of index '{Name}'.");
-                    onProgress?.Invoke(result.Progress);
-
-                    using (var context = QueryOperationContext.Allocate(DocumentDatabase, this))
-                    using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
-                    using (CurrentIndexingScope.Current = new CurrentIndexingScope(this, DocumentDatabase.DocumentsStorage, context, Definition, indexContext, GetOrAddSpatialField, _unmanagedBuffersPool))
-                    using (var txw = indexContext.OpenWriteTransaction())
-                    using (var writer = IndexPersistence.OpenIndexWriter(indexContext.Transaction.InnerTransaction, indexContext))
-                    {
-                        writer.Optimize();
-
-                        txw.Commit();
-                    }
-                }
             }
         }
 
+        public void Optimize(IndexOptimizeResult result, CancellationToken token)
+        {
+            AssertCompactionOrOptimizationIsNotInProgress(Name, nameof(Optimize));
+            
+            try
+            {
+                _isCompactionInProgress = true;
+                using (DrainRunningQueries())
+                using (RestartEnvironment(onBeforeEnvironmentDispose: () =>
+                       {
+                           result.Message = $"Optimization of index {Name} started...";
+                           OptimizeInternal(token);
+                       }))
+                {
+                }
+            }
+            finally
+            {
+                _isCompactionInProgress = false;
+            }
+        }
+
+        private void OptimizeInternal(CancellationToken token)
+        {
+            try
+            {
+                using (var context = QueryOperationContext.Allocate(DocumentDatabase, this))
+                using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
+                using (CurrentIndexingScope.Current = new CurrentIndexingScope(this, DocumentDatabase.DocumentsStorage, context, Definition, indexContext, GetOrAddSpatialField, _unmanagedBuffersPool))
+                using (var txw = indexContext.OpenWriteTransaction())
+                using (var writer = IndexPersistence.OpenIndexWriter(indexContext.Transaction.InnerTransaction, indexContext))
+                {
+                    writer.Optimize(token);
+
+                    txw.Commit();
+                }
+            }
+            catch (Exception e)
+            {
+                if (_logger.IsOperationsEnabled)
+                    _logger.Operations("Unable to complete optimization, index is not usable and may require reset of the index to recover", e);
+
+                throw;
+            }
+        }
+        
+        private void AssertCompactionOrOptimizationIsNotInProgress(string name, string operation)
+        {
+            if (_isCompactionInProgress)
+                throw new InvalidOperationException($"Index '{Name}' cannot be '{operation}' because compaction/optimization is already in progress.");
+        }
+        
         public IDisposable RestartEnvironment(Action onBeforeEnvironmentDispose = null)
         {
             // shutdown environment
@@ -5045,7 +5138,7 @@ namespace Raven.Server.Documents.Indexes
             }
         }
 
-        private TestingStuff _forTestingPurposes;
+        internal TestingStuff _forTestingPurposes;
 
         internal TestingStuff ForTestingPurposesOnly()
         {
@@ -5058,6 +5151,10 @@ namespace Raven.Server.Documents.Indexes
         internal class TestingStuff
         {
             internal Action ActionToCallInFinallyOfExecuteIndexing;
+
+            internal bool ShouldRenewTransaction;
+
+            internal Action BeforeClosingDocumentsReadTransactionForHandleReferences;
 
             internal IDisposable CallDuringFinallyOfExecuteIndexing(Action action)
             {

@@ -217,6 +217,66 @@ namespace RachisTests.DatabaseCluster
         }
 
         [Fact]
+        public async Task OnlyOneNodeShouldUpdateRehab()
+        {
+            var clusterSize = 3;
+            DefaultClusterSettings[RavenConfiguration.GetKey(x => x.Cluster.MaxChangeVectorDistance)] = "1";
+
+            var cluster = await CreateRaftCluster(clusterSize, watcherCluster: true);
+            using (var store = GetDocumentStore(new Options
+                   {
+                       ReplicationFactor = 3,
+                       Server = cluster.Leader,
+                       ModifyDocumentStore = s => s.Conventions = new DocumentConventions
+                       {
+                           DisableTopologyUpdates = true
+                       }
+                   }))
+            {
+                var val = await WaitForValueAsync(async () => await GetMembersCount(store), 3);
+                Assert.Equal(3, val);
+
+                var mre = new ManualResetEventSlim(false);
+                var slow = Servers.First(s => s != cluster.Leader);
+                try
+                {
+                    slow.ServerStore.DatabasesLandlord.ForTestingPurposesOnly().DelayIncomingReplication = mre.Wait;
+
+                    await store.Maintenance.SendAsync(new CreateSampleDataOperation());
+
+                    using (var session = store.OpenAsyncSession())
+                    {
+                        await session.StoreAsync(new User(), "users/1");
+                        await session.StoreAsync(new User(), "users/2");
+                        await session.SaveChangesAsync();
+                    }
+
+                    val = await WaitForValueAsync(async () => await GetMembersCount(store), 2);
+                    Assert.Equal(2, val);
+
+                    val = await WaitForValueAsync(async () => await GetRehabCount(store), 1);
+                    Assert.Equal(1, val);
+
+                    var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
+                    var topology = record.Topology;
+                    var rehabTag = topology.Rehabs.Single();
+                    var rehabServer = Servers.Single(s => s.ServerStore.NodeTag == rehabTag);
+                    var database = await rehabServer.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+
+                    val = await WaitForValueAsync(database.ReplicationLoader.IncomingConnections.Count, 1);
+                    Assert.Equal(1, val);
+                }
+                finally
+                {
+                    mre.Set();
+                }
+                
+                val = await WaitForValueAsync(async () => await GetMembersCount(store), 3);
+                Assert.Equal(3, val);
+            }
+        }
+
+        [Fact]
         public async Task DontMoveToRehabOnNoChangeAfterTimeout()
         {
             var clusterSize = 3;
@@ -248,10 +308,7 @@ namespace RachisTests.DatabaseCluster
 
                 cluster.Leader.ServerStore.ClusterMaintenanceSupervisor.ForTestingPurposesOnly().SetTriggerTimeoutAfterNoChangeAction("B");
 
-                await Task.Delay(2 * 1000); // twice the StabilizationTime
-
-                var members = await GetMembersCount(store);
-                Assert.Equal(3, members);
+                await WaitForValueAsync(async () => await GetMembersCount(store), expectedVal: 3, timeout: 15_000);
             }
         }
 
@@ -419,12 +476,11 @@ namespace RachisTests.DatabaseCluster
                 int val;
                 using (new DisposableAction(() =>
                 {
-                    preferred.ServerStore.DatabasesLandlord.DatabasesCache.TryRemove(databaseName, out var t);
-                    if (t == tcs.Task)
+                    if (preferred.ServerStore.DatabasesLandlord.DatabasesCache.TryRemove(databaseName, tcs.Task))
                         tcs.SetCanceled();
                 }))
                 {
-                    var t = preferred.ServerStore.DatabasesLandlord.DatabasesCache.Replace(databaseName, tcs.Task);
+                    var t = preferred.ServerStore.DatabasesLandlord.DatabasesCache.ForTestingPurposesOnly().Replace(databaseName, tcs.Task);
                     t.Result.Dispose();
 
                     Assert.True(await WaitForValueAsync(async () =>
@@ -1058,7 +1114,8 @@ namespace RachisTests.DatabaseCluster
                 // ensure that at this point we still can't talk to node
                 await Task.Delay(fromSeconds); // wait for the observer to update the status
                 dbToplogy = (await leaderStore.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(databaseName))).Topology;
-                Assert.Equal(1, dbToplogy.Rehabs.Count);
+                
+                Assert.True(1 == dbToplogy.Rehabs.Count, $"topology: {dbToplogy}");
                 Assert.Equal(groupSize - 1, dbToplogy.Members.Count);
             }
 

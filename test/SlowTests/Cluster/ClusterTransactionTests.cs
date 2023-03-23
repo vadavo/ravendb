@@ -278,11 +278,14 @@ namespace SlowTests.Cluster
                                 }
 
                                 if (numberOfNodes > 1)
-                                    await ActionWithLeader(l =>
+                                    await ActionWithLeader(async l =>
                                     {
+                                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                                        var waitForLeaderChangeTask = l.ServerStore.Engine.WaitForLeaderChange(cts.Token);
                                         l.ServerStore.Engine.CurrentLeader?.StepDown();
-                                        return Task.CompletedTask;
+                                        await waitForLeaderChangeTask;
                                     });
+
                                 using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(numberOfNodes)))
                                 {
                                     await session.SaveChangesAsync(cts.Token);
@@ -366,7 +369,7 @@ namespace SlowTests.Cluster
             var members = new List<string> {"A", "B", "C"};
             members.Remove(removedTag);
 
-            leader.ServerStore.Observer.Suspended = true;
+            Cluster.SuspendObserver(leader);
 
             using (var store = GetDocumentStore(new Options {Server = leader, ModifyDatabaseRecord = r => r.Topology = new DatabaseTopology {Members = members}}))
             {
@@ -1427,6 +1430,69 @@ namespace SlowTests.Cluster
                     var record = await storeB.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(database));
                     return record.DeletionInProgress.Count;
                 }, 0);
+            }
+        }
+
+        [Fact]
+        public async Task BlockWorkingWithAtomicGuardBySession()
+        {
+            using (var store = GetDocumentStore())
+            {
+                using (var session = store.OpenAsyncSession(new SessionOptions { TransactionMode = TransactionMode.ClusterWide }))
+                {
+                    var doc = new User { Name = "Grisha" };
+                    await session.StoreAsync(doc, "users/1");
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession(new SessionOptions { TransactionMode = TransactionMode.ClusterWide }))
+                {
+                    var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => session.Advanced.ClusterTransaction.GetCompareExchangeValueAsync<string>(GetAtomicGuardKey("users/1")));
+                    Assert.Contains($"'rvn-atomic/users/1' is an atomic guard and you cannot load it via the session", ex.Message);
+                }
+
+                using (var session = store.OpenAsyncSession(new SessionOptions { TransactionMode = TransactionMode.ClusterWide }))
+                {
+                    session.Advanced.ClusterTransaction.CreateCompareExchangeValue(GetAtomicGuardKey("users/2"), "foo");
+                    var ex = await Assert.ThrowsAsync<CompareExchangeInvalidKeyException>(() => session.SaveChangesAsync());
+                    Assert.Contains($"You cannot manipulate the atomic guard 'rvn-atomic/users/2' via the cluster-wide session", ex.Message);
+                }
+
+                string GetAtomicGuardKey(string id)
+                {
+                    return $"{Constants.CompareExchange.RvnAtomicPrefix}{id}";
+                }
+            }
+        }
+
+        private class AtomicGuard
+        {
+#pragma warning disable CS0649
+            public string Id;
+#pragma warning restore CS0649
+            public bool Locked;
+        }
+
+        [Fact]
+        public async Task CanModifyingAtomicGuardViaOperations()
+        {
+            using (var store = GetDocumentStore())
+            {
+                const string docId = "users/1";
+                using (var session = store.OpenAsyncSession(new SessionOptions { TransactionMode = TransactionMode.ClusterWide }))
+                {
+                    var doc = new User { Name = "Grisha" };
+                    await session.StoreAsync(doc, docId);
+                    await session.SaveChangesAsync();
+                }
+
+                var compareExchangeKey = $"rvn-atomic/{docId}";
+                var val = await store.Operations.SendAsync(new GetCompareExchangeValueOperation<AtomicGuard>(compareExchangeKey));
+                val.Value.Locked = true;
+                await store.Operations.SendAsync(new PutCompareExchangeValueOperation<AtomicGuard>(val.Key, val.Value, val.Index));
+
+                val = await store.Operations.SendAsync(new GetCompareExchangeValueOperation<AtomicGuard>(compareExchangeKey));
+                Assert.Equal(true, val.Value.Locked);
             }
         }
 

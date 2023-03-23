@@ -125,7 +125,7 @@ namespace Voron.Platform.Win32
                 {
                     var directoryPath = Path.GetDirectoryName(filePath);
                     // disk space info is expecting the directory path and not the file path
-                    var driveInfo = DiskSpaceChecker.GetDiskSpaceInfo(directoryPath);
+                    var driveInfo = DiskUtils.GetDiskSpaceInfo(directoryPath);
                     throw new DiskFullException(filePath, length, driveInfo?.TotalFreeSpace.GetValue(SizeUnit.Bytes), new Win32Exception(lastError).Message);
                 }
 
@@ -144,7 +144,8 @@ namespace Voron.Platform.Win32
     {
         ERROR_FILE_NOT_FOUND = 0x2,
         ERROR_DISK_FULL = 0x70,
-        ERROR_NOT_READY = 0x15
+        ERROR_NOT_READY = 0x15,
+        ERROR_HANDLE_DISK_FULL = 0x27
     }
 
     public enum Win32NativeFileMoveMethod : uint

@@ -1,6 +1,10 @@
 import documentMetadata = require("models/database/documents/documentMetadata");
+import genUtils = require("common/generalUtils");
 
 class document implements documentBase {
+    
+    static readonly hugeSizeInBytesDefault = 10_485_760; // 10 MB
+    static readonly hugeSizeFormatted = genUtils.formatBytesToSize(document.hugeSizeInBytesDefault);
     
     static readonly customColumnName = "@@x => x.getId()@@";
 
@@ -15,7 +19,7 @@ class document implements documentBase {
 
     constructor(dto: documentDto) {
         this.__metadata = new documentMetadata(dto["@metadata"]);
-        for (let property in dto) {
+        for (const property in dto) {
             if (property !== "@metadata") {
                 (<any>this)[property] = dto[property];
             }
@@ -36,7 +40,7 @@ class document implements documentBase {
 
     getDocumentPropertyNames(): Array<string> {
         const propertyNames: Array<string> = [];
-        for (let property in this) {
+        for (const property in this) {
             const isMeta = property === "__metadata" || property === "__moduleId__";
             const isFunction = _.isFunction((this as any)[property]);
             if (!isMeta && !isFunction) {
@@ -47,11 +51,11 @@ class document implements documentBase {
         return propertyNames;
     }
 
-    toDto(includeMeta: boolean = false): documentDto {
+    toDto(includeMeta = false): documentDto {
         const dto: any = { };
         const properties = this.getDocumentPropertyNames();
         for (let i = 0; i < properties.length; i++) {
-            let property = properties[i];
+            const property = properties[i];
             dto[property] = (<any>this)[property];
         }
 
@@ -108,18 +112,20 @@ class document implements documentBase {
         const indexes = [id.indexOf("/"), id.indexOf("|")].filter(x => x !== -1);
         const firstSeparatorIndex = _.min(indexes.length ? indexes : [-1]);
 
+        let collectionName = id.substring(0, firstSeparatorIndex);
+        
         if (firstSeparatorIndex >= 1) {
-            let collectionName = id.substring(0, firstSeparatorIndex);
-            
             if (collectionName.toLocaleLowerCase() === collectionName) {
                 // All letters are lower case, Capitalize first 
                 collectionName = _.capitalize(collectionName);
-            } else {
-                // Find an already existing matching collection name 
-                collectionName = collections.find(collection => collection.toLocaleLowerCase() === collectionName.toLocaleLowerCase());
             }
-        
-             return collectionName;
+            return collectionName;
+        } else {
+            // Find an already existing matching collection name 
+            collectionName = collections.find(collection => collection.toLocaleLowerCase() === collectionName.toLocaleLowerCase());
+            if (collectionName) {
+                return collectionName;
+            }
         }
 
         // if no '/' or '|' at all then we want the document to be in the @empty collection

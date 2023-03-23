@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -8,6 +9,7 @@ using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Exceptions;
+using Raven.Client.Exceptions.Database;
 using Raven.Client.Exceptions.Documents;
 using Raven.Server.Config;
 using Raven.Server.Documents.Expiration;
@@ -227,6 +229,17 @@ namespace Raven.Server.Documents
                 ("Starting to open document storage for " + (DocumentDatabase.Configuration.Core.RunInMemory
                      ? "<memory>"
                      : DocumentDatabase.Configuration.Core.DataDirectory.FullPath));
+            }
+
+            if (DocumentDatabase.Configuration.Core.RunInMemory == false)
+            {
+                string disableMarkerPath = DocumentDatabase.Configuration.Core.DataDirectory.Combine("disable.marker").FullPath;
+                if (File.Exists(disableMarkerPath))
+                {
+                    throw new DatabaseDisabledException(
+                        $"Unable to open database: '{_name}', it has been manually disabled via the file: '{disableMarkerPath}'. To re-enable, remove the disable.marker and reload the database.");
+                }
+
             }
 
             var options = GetStorageEnvironmentOptionsFromConfiguration(DocumentDatabase.Configuration, DocumentDatabase.IoChanges, DocumentDatabase.CatastrophicFailureNotification);
@@ -726,29 +739,32 @@ namespace Raven.Server.Documents
             return lastEtag;
         }
 
-        public IEnumerable<Document> GetDocumentsStartingWith(DocumentsOperationContext context, string idPrefix,  string startAfterId,
-            long start, long take, string collection, Reference<long> skippedResults, DocumentFields fields = DocumentFields.All)
+        public IEnumerable<Document> GetDocumentsStartingWith(DocumentsOperationContext context, string idPrefix, string startAfterId,
+            long start, long take, string collection, Reference<long> skippedResults, DocumentFields fields = DocumentFields.All, CancellationToken token = default)
         {
-            int alreadyReturnedDocumentsCount = 0;
-            int lastLoadedDocumentsCount;
             var isAllDocs = collection == Constants.Documents.Collections.AllDocumentsCollection;
+            var isEmptyCollection = collection == Constants.Documents.Collections.EmptyCollection;
             var requestedDataField = fields.HasFlag(DocumentFields.Data);
             if (isAllDocs == false && requestedDataField == false)
                 fields |= DocumentFields.Data;
-            
-            do
+
+            using (var collectionAsLazyString = context.GetLazyString(collection))
             {
-                lastLoadedDocumentsCount = 0;
-                foreach (var doc in GetDocumentsStartingWith(context, idPrefix, null, null, startAfterId, start, take, fields: fields))
+                // we request ALL documents that start with `idPrefix` and filter it here by the collection name
+                foreach (var doc in GetDocumentsStartingWith(context, idPrefix, null, null, startAfterId, start, take: long.MaxValue, fields: fields))
                 {
-                    lastLoadedDocumentsCount++;
+                    token.ThrowIfCancellationRequested();
+
                     if (isAllDocs)
                     {
+                        if (take-- < 0)
+                            break;
+
                         yield return doc;
                         continue;
                     }
 
-                    if (IsCollectionMatch(doc, collection) == false)
+                    if (IsCollectionMatch(doc) == false)
                     {
                         skippedResults.Value++;
                         doc.Dispose();
@@ -761,35 +777,41 @@ namespace Raven.Server.Documents
                         doc.Data = null;
                     }
 
-                    alreadyReturnedDocumentsCount++;
-                    yield return doc;
-
-                    if (alreadyReturnedDocumentsCount >= take)
+                    if (take-- <= 0)
+                    {
+                        doc.Dispose();
                         break;
+                    }
 
+                    yield return doc;
                 }
 
-                start += take;
-            }
-            while (alreadyReturnedDocumentsCount != take && lastLoadedDocumentsCount > 0);
+                bool IsCollectionMatch(Document doc)
+                {
+                    if (doc.TryGetMetadata(out var metadata) == false)
+                        return false;
 
-            static bool IsCollectionMatch(Document doc, string collection)
-            {
-                if (doc.TryGetMetadata(out var metadata) == false)
-                    return false;
+                    if (metadata.TryGet(Constants.Documents.Metadata.Collection, out LazyStringValue c) == false)
+                        return false;
 
-                if (metadata.TryGet(Constants.Documents.Metadata.Collection, out string c) == false)
-                    return false;
+                    if (c != null)
+                    {
+                        if (collectionAsLazyString.EqualsOrdinalIgnoreCase(c) == false)
+                            return false;
+                    }
+                    else
+                    {
+                        if (isEmptyCollection == false)
+                            return false;
+                    }
 
-                if (string.Equals(c, collection, StringComparison.OrdinalIgnoreCase) == false)
-                    return false;
-
-                return true;
+                    return true;
+                }
             }
         }
 
         public IEnumerable<Document> GetDocumentsStartingWith(DocumentsOperationContext context, string idPrefix, string matches, string exclude, string startAfterId,
-            long start, long take, Reference<long> skip = null, DocumentFields fields = DocumentFields.All)
+            long start, long take, Reference<long> skip = null, DocumentFields fields = DocumentFields.All, CancellationToken token = default)
         {
             var table = new Table(DocsSchema, context.Transaction.InnerTransaction);
 
@@ -802,6 +824,8 @@ namespace Raven.Server.Documents
             {
                 foreach (var result in table.SeekByPrimaryKeyPrefix(prefixSlice, startAfterSlice, skip?.Value ?? 0))
                 {
+                    token.ThrowIfCancellationRequested();
+
                     var document = TableValueToDocument(context, ref result.Value.Reader, fields);
                     string documentId = document.Id;
                     if (documentId.StartsWith(idPrefix, StringComparison.OrdinalIgnoreCase) == false)
@@ -1745,7 +1769,7 @@ namespace Raven.Server.Documents
                     {
                         if (DocumentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionOldDocument(context, flags, local.Document.Data, local.Document.ChangeVector, collectionName))
                         {
-                            DocumentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, local.Document.Data, flags | DocumentFlags.HasRevisions, NonPersistentDocumentFlags.None,
+                            DocumentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, local.Document.Data, flags | DocumentFlags.HasRevisions | DocumentFlags.FromOldDocumentRevision, NonPersistentDocumentFlags.None,
                                 local.Document.ChangeVector, local.Document.LastModified.Ticks, configuration, collectionName);
                         }
 
@@ -1755,9 +1779,10 @@ namespace Raven.Server.Documents
                     }
                 }
 
-                if (((flags & DocumentFlags.HasRevisions) == DocumentFlags.HasRevisions) &&
-                    (revisionsStorage.Configuration == null) &&
-                    ((flags & DocumentFlags.Resolved) != DocumentFlags.Resolved))
+                if (flags.Contain(DocumentFlags.HasRevisions) &&
+                    revisionsStorage.Configuration == null &&
+                    flags.Contain(DocumentFlags.Resolved) == false &&
+                    nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false)
                     revisionsStorage.DeleteRevisionsFor(context, id);
 
                 if (flags.Contain(DocumentFlags.HasRevisions) &&
@@ -2095,7 +2120,7 @@ namespace Raven.Server.Documents
         private void ThrowNotSupportedExceptionForCreatingTombstoneWhenItExistsForDifferentCollection(Slice lowerId, CollectionName collectionName,
             CollectionName tombstoneCollectionName, VoronConcurrencyErrorException e)
         {
-            var tombstoneCleanerState = DocumentDatabase.TombstoneCleaner.GetState();
+            var tombstoneCleanerState = DocumentDatabase.TombstoneCleaner.GetState().Tombstones;
             if (tombstoneCleanerState.TryGetValue(tombstoneCollectionName.Name, out var item) && item.Documents.Component != null)
                 throw new NotSupportedException($"Could not delete document '{lowerId}' from collection '{collectionName.Name}' because tombstone for that document already exists but in a different collection ('{tombstoneCollectionName.Name}'). Did you change the document's collection recently? If yes, please give some time for other system components (e.g. Indexing, Replication, Backup) and tombstone cleaner to process that change. At this point of time the component that holds the tombstone is '{item.Documents.Component}' with etag '{item.Documents.Etag}' and tombstone cleaner is executed every '{DocumentDatabase.Configuration.Tombstones.CleanupInterval.AsTimeSpan.TotalMinutes}' minutes.", e);
 

@@ -10,6 +10,7 @@ class collection {
     static readonly hiloCollectionName = "@hilo";
 
     documentCount: KnockoutObservable<number> = ko.observable(0);
+    lastDocumentChangeVector = ko.observable<string>();
     name: string;
     sizeClass: KnockoutComputed<string>;
     countPrefix: KnockoutComputed<string>;
@@ -17,7 +18,7 @@ class collection {
 
     private db: database;
 
-    constructor(name: string, ownerDatabase: database, docCount: number = 0) {
+    constructor(name: string, ownerDatabase: database, docCount = 0) {
         this.name = name;
         this.db = ownerDatabase;
         this.documentCount(docCount);

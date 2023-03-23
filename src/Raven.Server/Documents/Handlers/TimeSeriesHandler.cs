@@ -11,6 +11,8 @@ using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations.TimeSeries;
 using Raven.Client.Documents.Session.TimeSeries;
 using Raven.Client.Exceptions.Documents;
+using Raven.Client.Http;
+using Raven.Client.ServerWide;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.TimeSeries;
 using Raven.Server.Json;
@@ -67,6 +69,7 @@ namespace Raven.Server.Documents.Handlers
                         first = false;
 
                         var stats = Database.DocumentsStorage.TimeSeriesStorage.Stats.GetStats(context, documentId, tsName);
+                        Debug.Assert(stats.Start.Kind == DateTimeKind.Utc);
 
                         writer.WriteStartObject();
 
@@ -195,6 +198,8 @@ namespace Raven.Server.Documents.Handlers
                     HttpContext.Response.StatusCode = (int)HttpStatusCode.NotFound;
                     return;
                 }
+
+                Debug.Assert(stats.Start.Kind == DateTimeKind.Utc);
 
                 var includesCommand = includeDoc || includeTags
                     ? new IncludeDocumentsDuringTimeSeriesLoadingCommand(context, documentId, includeDoc, includeTags)
@@ -594,6 +599,7 @@ namespace Raven.Server.Documents.Handlers
                 {
                     Debug.Assert(context != null);
                     stats = context.DocumentDatabase.DocumentsStorage.TimeSeriesStorage.Stats.GetStats(context, documentId, name);
+                    Debug.Assert(stats == default || stats.Start.Kind == DateTimeKind.Utc);
                 }
 
                 for (var i = 0; i < ranges.Count; i++)
@@ -647,6 +653,7 @@ namespace Raven.Server.Documents.Handlers
                 {
                     Debug.Assert(context != null);
                     stats = context.DocumentDatabase.DocumentsStorage.TimeSeriesStorage.Stats.GetStats(context, documentId, name);
+                    Debug.Assert(stats == default || stats.Start.Kind == DateTimeKind.Utc);
                 }
 
                 for (var i = 0; i < ranges.Count; i++)
@@ -842,7 +849,7 @@ namespace Raven.Server.Documents.Handlers
         public async Task ConfigTimeSeries()
         {
             await DatabaseConfigurations(
-                ServerStore.ModifyTimeSeriesConfiguration,
+                ModifyTimeSeriesConfiguration,
                 "read-timeseries-config",
                 GetRaftRequestIdFromQuery(),
                 beforeSetupConfiguration: (string name, ref BlittableJsonReaderObject configuration, JsonOperationContext context) =>
@@ -872,6 +879,26 @@ namespace Raven.Server.Documents.Handlers
                         }
                     }
                 });
+        }
+
+        private async Task<(long, object)> ModifyTimeSeriesConfiguration(TransactionOperationContext context, string name, BlittableJsonReaderObject configurationJson, string raftRequestId)
+        {
+            var configuration = JsonDeserializationCluster.TimeSeriesConfiguration(configurationJson);
+            configuration?.InitializeRollupAndRetention();
+            ServerStore.LicenseManager.AssertCanAddTimeSeriesRollupsAndRetention(configuration);
+            var editTimeSeries = new EditTimeSeriesConfigurationCommand(configuration, name, raftRequestId);
+            var result = await ServerStore.SendToLeaderAsync(editTimeSeries);
+
+            DatabaseTopology topology;
+            ClusterTopology clusterTopology;
+            using (context.OpenReadTransaction())
+            {
+                topology = ServerStore.Cluster.ReadDatabaseTopology(context, name);
+                clusterTopology = ServerStore.GetClusterTopology(context);
+            }
+            await WaitForExecutionOnRelevantNodes(context, name, clusterTopology, topology.Members, result.Index);
+
+            return result;
         }
 
         [RavenAction("/databases/*/admin/timeseries/policy", "PUT", AuthorizationStatus.DatabaseAdmin)]
@@ -1021,6 +1048,7 @@ namespace Raven.Server.Documents.Handlers
             private readonly bool _fromEtl;
 
             public string LastChangeVector;
+            public string DocCollection;
 
             public ExecuteTimeSeriesBatchCommand(DocumentDatabase database, string documentId, TimeSeriesOperation operation, bool fromEtl)
             {
@@ -1032,9 +1060,9 @@ namespace Raven.Server.Documents.Handlers
 
             protected override long ExecuteCmd(DocumentsOperationContext context)
             {
-                string docCollection = GetDocumentCollection(_database, context, _documentId, _fromEtl);
+                DocCollection = GetDocumentCollection(_database, context, _documentId, _fromEtl);
 
-                if (docCollection == null)
+                if (DocCollection == null)
                     return 0L;
 
                 var changes = 0L;
@@ -1047,7 +1075,7 @@ namespace Raven.Server.Documents.Handlers
                         var deletionRange = new TimeSeriesStorage.DeletionRangeRequest
                         {
                             DocumentId = _documentId,
-                            Collection = docCollection,
+                            Collection = DocCollection,
                             Name = _operation.Name,
                             From = removal.From ?? DateTime.MinValue,
                             To = removal.To ?? DateTime.MaxValue
@@ -1063,7 +1091,7 @@ namespace Raven.Server.Documents.Handlers
                 {
                     LastChangeVector = tss.IncrementTimestamp(context,
                         _documentId,
-                        docCollection,
+                        DocCollection,
                         _operation.Name,
                         _operation.Increments
                     );
@@ -1076,7 +1104,7 @@ namespace Raven.Server.Documents.Handlers
 
                 LastChangeVector = tss.AppendTimestamp(context,
                     _documentId,
-                    docCollection,
+                    DocCollection,
                     _operation.Name,
                     _operation.Appends
                 );
@@ -1130,7 +1158,7 @@ namespace Raven.Server.Documents.Handlers
                                                     "Cannot put TimeSeries on artificial documents.");
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 throw new System.NotImplementedException();
             }
@@ -1188,17 +1216,20 @@ namespace Raven.Server.Documents.Handlers
                 return changes;
             }
 
-            public void AddToDictionary(TimeSeriesItem item)
+            public bool AddToDictionary(TimeSeriesItem item)
             {
+                bool newItem = false;
                 if (_dictionary.TryGetValue(item.DocId, out var itemsList) == false)
                 {
                     _dictionary[item.DocId] = itemsList = new List<TimeSeriesItem>();
+                    newItem = true;
                 }
 
                 itemsList.Add(item);
+                return newItem;
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 throw new System.NotImplementedException();
             }

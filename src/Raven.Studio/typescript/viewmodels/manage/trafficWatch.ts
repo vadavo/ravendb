@@ -13,9 +13,11 @@ import virtualColumn = require("widgets/virtualGrid/columns/virtualColumn");
 import recentQueriesStorage = require("common/storage/savedQueriesStorage");
 import queryCriteria = require("models/database/query/queryCriteria");
 import databasesManager = require("common/shell/databasesManager");
+import accessManager = require("common/shell/accessManager");
 import TrafficWatchHttpChange = Raven.Client.Documents.Changes.TrafficWatchHttpChange;
 import trafficWatchQueriesDialog from "viewmodels/manage/trafficWatchQueriesDialog";
 import app = require("durandal/app");
+import appUrl = require("common/appUrl");
 
 type trafficChangeType = Raven.Client.Documents.Changes.TrafficWatchChangeType | Raven.Client.ServerWide.Tcp.TcpConnectionHeaderMessage.OperationTypes;
 
@@ -23,7 +25,7 @@ class runQueryFeature implements columnPreviewFeature {
 
     private queryList: string[] = [];
 
-    install($tooltip: JQuery, valueProvider: () => any, elementProvider: () => any, containerSelector: string): void {
+    install($tooltip: JQuery, valueProvider: () => any, elementProvider: () => any): void {
         $tooltip.on("click", ".run-query", () => {
             const value = valueProvider();
             const item: Raven.Client.Documents.Changes.TrafficWatchChangeBase = elementProvider();
@@ -122,11 +124,30 @@ type certificateInfo = {
     clearance: Raven.Client.ServerWide.Operations.Certificates.SecurityClearance;
 }
 
+interface statistics {
+    min: string;
+    avg: string;
+    max: string;
+    percentile_90: string;
+    percentile_99: string;
+    percentile_99_9: string;
+}
+
+const notAvailableStats: statistics = {
+    min: "N/A",
+    avg: "N/A",
+    percentile_90: "N/A",
+    percentile_99: "N/A",
+    percentile_99_9: "N/A",
+    max: "N/A"
+}
+
 class trafficWatch extends viewModelBase {
     
     view = require("views/manage/trafficWatch.html");
     
     static readonly usingHttps = location.protocol === "https:";
+    static readonly isSecureServer = accessManager.default.secureServer();
     
     static maxBufferSize = 200000;
     
@@ -159,16 +180,14 @@ class trafficWatch extends viewModelBase {
     
     onlyErrors = ko.observable<boolean>(false);
 
+    adminLogsUrl = appUrl.forAdminLogs() + "?highlightTrafficWatch=true"
+
     stats = {
         sourceIpsCount: ko.observable<string>(),
         httpRequestCount: ko.observable<string>(),
         tcpOperationCount: ko.observable<string>(),
-        min: ko.observable<string>(),
-        avg: ko.observable<string>(),
-        max: ko.observable<string>(),
-        percentile_90: ko.observable<string>(),
-        percentile_99: ko.observable<string>(),
-        percentile_99_9: ko.observable<string>()
+        requestDuration: ko.observable<statistics>(notAvailableStats),
+        responseSize: ko.observable<statistics>(notAvailableStats)
     };
     
     filter = ko.observable<string>();
@@ -204,7 +223,7 @@ class trafficWatch extends viewModelBase {
         }
         this.updateHelpLink('EVEP6I');
 
-        if (trafficWatch.usingHttps) {
+        if (trafficWatch.isSecureServer) {
             return this.loadCertificates();
         }
     }
@@ -326,76 +345,57 @@ class trafficWatch extends viewModelBase {
         this.stats.httpRequestCount(this.filteredDataHttp.length.toLocaleString());
         this.stats.tcpOperationCount(this.filteredDataTcp.length.toLocaleString());
 
-        if (!this.filteredDataHttp.length) {
-            this.httpStatsNotAvailable();
-        } else {
-            const filteredDataHttpNoWebSockets = this.filteredDataHttp.filter(x => x.ResponseStatusCode !== 101);
+        const filteredDataHttpNoWebSockets = this.filteredTypeDataHttp.length ? this.filteredDataHttp.filter(x => x.ResponseStatusCode !== 101) : [];
             
-            if (filteredDataHttpNoWebSockets.length === 0) {
-                this.httpStatsNotAvailable();
-            } else {
-                this.updateDurationStats(filteredDataHttpNoWebSockets);
-                this.updatePercentiles(filteredDataHttpNoWebSockets);
+        this.stats.requestDuration(trafficWatch.computeStats(filteredDataHttpNoWebSockets, x => x.ElapsedMilliseconds, x => generalUtils.formatTimeSpan(x, false)));
+        this.stats.responseSize(trafficWatch.computeStats(filteredDataHttpNoWebSockets, x => x.ResponseSizeInBytes, x => generalUtils.formatBytesToSize(x, 1)));
             }
-        }
-    }
                 
-    private httpStatsNotAvailable(): void {
-        this.stats.avg("N/A");
-        this.stats.min("N/A");
-        this.stats.max("N/A");
-
-        this.stats.percentile_90("N/A");
-        this.stats.percentile_99("N/A");
-        this.stats.percentile_99_9("N/A");
+    private static computeStats(data: TrafficWatchHttpChange[],
+                                accessor: (item: TrafficWatchHttpChange) => number,
+                                formatter: (value: number) => string): statistics {
+        if (data.length === 0) {
+            return notAvailableStats;
                 }
 
-    private updateDurationStats(data: Raven.Client.Documents.Changes.TrafficWatchHttpChange[]): void {
-        const firstItem = data[0];
-
+        const scalars: number[] = [];
+        let min = accessor(data[0]);
+        let max = accessor(data[0]);
         let sum = 0;
-        let min = firstItem.ElapsedMilliseconds;
-        let max = firstItem.ElapsedMilliseconds;
-
-        for (let i = 0; i < data.length; i++) {
-            const item = data[i];
-
-                if (item.ElapsedMilliseconds < min) {
-                    min = item.ElapsedMilliseconds;
-                }
-
-                if (item.ElapsedMilliseconds > max) {
-                    max = item.ElapsedMilliseconds;
-                }
-
-                sum += item.ElapsedMilliseconds;
-            }
-
-            this.stats.min(generalUtils.formatTimeSpan(min, false));
-            this.stats.max(generalUtils.formatTimeSpan(max, false));
-        this.stats.avg(generalUtils.formatTimeSpan(sum / data.length));
-            }
-    
-    private updatePercentiles(data: Raven.Client.Documents.Changes.TrafficWatchHttpChange[]): void {
-        const timings: number[] = [];
 
         for (let i = data.length - 1; i >= 0; i--) {
             const item = data[i];
+            const value = accessor(item);
 
-            if (timings.length === 2048) {
+            if (scalars.length === 2048) {
                 // compute using max 2048 latest values
                 break;
+                }
+
+            if (value < min) {
+                min = value;
+                }
+
+            if (value > max) {
+                max = value;
             }
 
-            timings.push(item.ElapsedMilliseconds);
-        }
+            sum += value;
 
-        timings.sort((a, b) => a - b);
-        
-        this.stats.percentile_90(generalUtils.formatTimeSpan(timings[Math.ceil(90 / 100 * timings.length) - 1]));
-        this.stats.percentile_99(generalUtils.formatTimeSpan(timings[Math.ceil(99 / 100 * timings.length) - 1]));
-        this.stats.percentile_99_9(generalUtils.formatTimeSpan(timings[Math.ceil(99.9 / 100 * timings.length) - 1]));
-    }
+            scalars.push(value);
+            }
+    
+        scalars.sort((a, b) => a - b);
+
+        return {
+            min: formatter(min),
+            avg: formatter(sum / scalars.length),
+            percentile_90: formatter(scalars[Math.ceil(90 / 100 * scalars.length) - 1]),
+            percentile_99: formatter(scalars[Math.ceil(99 / 100 * scalars.length) - 1]),
+            percentile_99_9: formatter(scalars[Math.ceil(99.9 / 100 * scalars.length) - 1]),
+            max: formatter(max)
+            }
+        }
 
     private formatSource(item: Raven.Client.Documents.Changes.TrafficWatchChangeBase, asHtml: boolean): string {
         const thumbprint = item.CertificateThumbprint;
@@ -475,7 +475,7 @@ class trafficWatch extends viewModelBase {
         
         const grid = this.gridController();
         grid.headerVisible(true);
-        grid.init((s, t) => this.fetchTraffic(s, t), () =>
+        grid.init(() => this.fetchTraffic(), () =>
             [
                 new textColumn<Raven.Client.Documents.Changes.TrafficWatchChangeBase>(grid,
                     x => generalUtils.formatUtcDateAsLocal(x.TimeStamp, trafficWatch.dateTimeFormat),
@@ -484,7 +484,7 @@ class trafficWatch extends viewModelBase {
                     sortable: "string"
                 }),
                 new textColumn<Raven.Client.Documents.Changes.TrafficWatchChangeBase>(grid,
-                    x => trafficWatch.usingHttps ? `<span class="icon-certificate text-info margin-right margin-right-xs"></span>${x.ClientIP}` : x.ClientIP,
+                    x => trafficWatch.isSecureServer ? `<span class="icon-certificate text-info margin-right margin-right-xs"></span>${x.ClientIP}` : x.ClientIP,
                     "Source", "8%", {
                     extraClass: rowHighlightRules,
                     useRawValue: () => true
@@ -495,6 +495,13 @@ class trafficWatch extends viewModelBase {
                         extraClass: rowHighlightRules,
                         sortable: "number"
                 }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChangeBase>(grid,
+                    x => trafficWatch.isHttpItem(x) ? x.RequestSizeInBytes : "n/a",
+                    "Request Size", "8%", {
+                        extraClass: rowHighlightRules,
+                        sortable: "number",
+                        transformValue: generalUtils.formatBytesToSize
+                    }),
                 new textColumn<Raven.Client.Documents.Changes.TrafficWatchChangeBase>(grid,
                     x => trafficWatch.isHttpItem(x) ? x.ResponseSizeInBytes : "n/a",
                     "Response Size", "8%", {
@@ -535,7 +542,7 @@ class trafficWatch extends viewModelBase {
                 }),
                 new textColumn<Raven.Client.Documents.Changes.TrafficWatchChangeBase>(grid,
                     x => trafficWatch.formatDetails(x),
-                    "Details", "28%", {
+                    "Details", "20%", {
                         extraClass: rowHighlightRules,
                         sortable: "string"
                 })
@@ -571,7 +578,7 @@ class trafficWatch extends viewModelBase {
         this.connectWebSocket();
     }
 
-    private fetchTraffic(skip: number, take: number): JQueryPromise<pagedResult<Raven.Client.Documents.Changes.TrafficWatchChangeBase>> {
+    private fetchTraffic(): JQueryPromise<pagedResult<Raven.Client.Documents.Changes.TrafficWatchChangeBase>> {
         const textFilterDefined = this.filter();
         
         const filterUsingTypeHttp = this.selectedTypeNamesHttp().length !== this.filteredTypeDataHttp.length;

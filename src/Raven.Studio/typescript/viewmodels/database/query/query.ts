@@ -46,6 +46,7 @@ import hyperlinkColumn = require("widgets/virtualGrid/columns/hyperlinkColumn");
 import moment = require("moment");
 import { highlight, languages } from "prismjs";
 import activeDatabaseTracker = require("common/shell/activeDatabaseTracker");
+import killQueryCommand from "commands/database/query/killQueryCommand";
 
 type queryResultTab = "results" | "explanations" | "timings" | "graph" | "revisions";
 
@@ -126,7 +127,8 @@ class includedRevisions {
 }
 
 class query extends viewModelBase {
-
+    
+    static readonly clientQueryId = "studio_" + new Date().getTime();
     static readonly dateTimeFormat = "YYYY-MM-DD HH:mm:ss.SSS";
 
     view = require("views/database/query/query.html");
@@ -146,7 +148,7 @@ class query extends viewModelBase {
 
     static readonly maxSpatialResultsToFetch = 5000;
     
-    autoOpenGraph: boolean = false;
+    autoOpenGraph = false;
 
     saveQueryFocus = ko.observable<boolean>(false);
 
@@ -187,6 +189,9 @@ class query extends viewModelBase {
     });
 
     inSaveMode = ko.observable<boolean>();
+
+    showKillQueryButton = ko.observable<boolean>(false);
+    killQueryTimeoutId: number;
     
     querySaveName = ko.observable<string>();
     saveQueryValidationGroup: KnockoutValidationGroup;
@@ -203,7 +208,7 @@ class query extends viewModelBase {
     cacheEnabled = ko.observable<boolean>(true);
     disableAutoIndexCreation = ko.observable<boolean>(true);
     
-    private indexEntriesStateWasTrue: boolean = false; // Used to save current query settings when switching to a 'dynamic' index
+    private indexEntriesStateWasTrue = false; // Used to save current query settings when switching to a 'dynamic' index
 
     columnsSelector = new columnsSelector<document>();
 
@@ -267,7 +272,6 @@ class query extends viewModelBase {
     termsUrl: KnockoutComputed<string>;
     visualizerUrl: KnockoutComputed<string>;
     rawJsonUrl = ko.observable<string>();
-    csvUrl = ko.observable<string>();
 
     containsAsterixQuery: KnockoutComputed<boolean>; // query contains: *.* ?
 
@@ -326,7 +330,8 @@ class query extends viewModelBase {
 
         this.bindToCurrentInstance("runRecentQuery", "previewQuery", "removeQuery", "useQuery", "useQueryItem", 
             "goToHighlightsTab", "goToIncludesTab", "goToGraphTab", "toggleResults", "goToTimeSeriesTab", "plotTimeSeries",
-            "closeTimeSeriesTab", "goToSpatialMapTab", "loadMoreSpatialResultsToMap", "goToIncludesRevisionsTab");
+            "closeTimeSeriesTab", "goToSpatialMapTab", "loadMoreSpatialResultsToMap", "goToIncludesRevisionsTab",
+            "killQuery");
     }
 
     private initObservables(): void {
@@ -359,8 +364,8 @@ class query extends viewModelBase {
             }
 
             const collectionRegex = /collection\/(.*)/;
-            let m;
-            if (m = indexName.match(collectionRegex)) {
+            const m = indexName.match(collectionRegex);
+            if (m) {
                 return m[1];
             }
 
@@ -634,7 +639,7 @@ class query extends viewModelBase {
         const documentsProvider = new documentBasedColumnsProvider(this.activeDatabase(), grid, {
             enableInlinePreview: true,
             detectTimeSeries: true,
-            timeSeriesActionHandler: (type, documentId, name, value, event) => {
+            timeSeriesActionHandler: (type, documentId, name, value) => {
                 if (type === "plot") {
                     const newChart = new timeSeriesPlotDetails([{ documentId, value, name}]);
 
@@ -690,7 +695,7 @@ class query extends viewModelBase {
         });
         
         this.columnsSelector.init(grid,
-            (s, t, c) => this.effectiveFetcher()(s, t),
+            (s, t) => this.effectiveFetcher()(s, t),
             (w, r) => {
                 const tab = this.currentTab();
                 if (tab === "results" || tab instanceof perCollectionIncludes) {
@@ -789,7 +794,7 @@ class query extends viewModelBase {
         if (!indexName) {
             this.queriedIndexInfo(null);
         } else {
-            let currentIndex = this.indexes() ? this.indexes().find(i => i.Name === indexName) : null;
+            const currentIndex = this.indexes() ? this.indexes().find(i => i.Name === indexName) : null;
             if (currentIndex) {
                 this.queriedIndexInfo(currentIndex);
             } else {
@@ -818,14 +823,14 @@ class query extends viewModelBase {
         };
         
         switch (timeSeriesQueryResult.detectResultType(tab.value)) {
-            case "grouped":
+            case "grouped": {
                 const groupedItems = tab.value.Results as Array<timeSeriesQueryGroupedItemResultDto>;
                 const groupKeys = timeSeriesQueryResult.detectGroupKeys(groupedItems);
-                
+
                 const aggregationColumns = groupKeys.map(key => {
                     return new textColumn<timeSeriesQueryGroupedItemResultDto>(grid, maybeArrayPresenter(key), key, (45 / groupKeys.length) + "%");
                 });
-                
+
                 return [
                     new textColumn<timeSeriesQueryGroupedItemResultDto>(grid, x => formatTimeSeriesDate(x.From), "From", "15%"),
                     new textColumn<timeSeriesQueryGroupedItemResultDto>(grid, x => formatTimeSeriesDate(x.To), "To", "15%"),
@@ -833,6 +838,7 @@ class query extends viewModelBase {
                     new textColumn<timeSeriesQueryGroupedItemResultDto>(grid, maybeArrayPresenter("Count"), "Count", "10%"),
                     ...aggregationColumns
                 ];
+            }
             case "raw":
                 return [
                     new textColumn<timeSeriesRawItemResultDto>(grid, x => formatTimeSeriesDate(x.Timestamp), "Timestamp", "30%"),
@@ -939,6 +945,20 @@ class query extends viewModelBase {
         this.updateUrl(url);
     }
 
+    killQuery() {
+        const db = this.activeDatabase();
+        this.confirmationMessage("Abort the query", "Do you want to abort currently running query?")
+            .done(result => {
+                if (result.can) {
+                    this.showKillQueryButton(false);
+                    if (this.spinners.isLoading()) {
+                        killQueryCommand.byClientQueryId(db, query.clientQueryId)
+                            .execute();
+                    }
+                }
+            });
+    }
+    
     runQuery(optionalSavedQueryName?: string): void {
         if (!this.isValid(this.criteria().validationGroup)) {
             return;
@@ -986,7 +1006,6 @@ class query extends viewModelBase {
             
             try {
                 this.rawJsonUrl(appUrl.forDatabaseQuery(database) + queryCmd.getUrl("GET"));
-                this.csvUrl(queryCmd.getCsvUrl());
             } catch (error) {
                 // it may throw when unable to compute query parameters, etc.
                 messagePublisher.reportError("Unable to run the query", error.message, null, false);
@@ -998,8 +1017,9 @@ class query extends viewModelBase {
             
             const resultsFetcher = (skip: number, take: number) => {
                 const criteriaForFetcher = this.lastCriteriaExecuted;
-                
-                const command = new queryCommand(database, skip + totalSkippedResults, take + 1, criteriaForFetcher, disableCache, disableAutoIndexCreation);
+
+                const command = new queryCommand(database, skip + totalSkippedResults, take + 1, criteriaForFetcher, disableCache, disableAutoIndexCreation, query.clientQueryId);
+                this.onQueryRun();
                 
                 const resultsTask = $.Deferred<pagedResultExtended<document>>();
                 const queryForAllFields = criteriaForFetcher.showFields();
@@ -1013,6 +1033,7 @@ class query extends viewModelBase {
                 command.execute()
                     .always(() => {
                         this.spinners.isLoading(false);
+                        this.afterQueryRun();
                     })
                     .done((queryResults: pagedResultExtended<document>) => {
                         this.hasMoreUnboundedResults(false);
@@ -1025,10 +1046,11 @@ class query extends viewModelBase {
                         }
 
                         const totalFromQuery = queryResults.totalResultCount || 0;
+                        const filterByQuery = !!queryResults.additionalResultInfo.ScannedResults;
                         
                         itemsSoFar += queryResults.items.length;
                         
-                        if (totalFromQuery != -1) {
+                        if (totalFromQuery !== -1) {
                             if (itemsSoFar > totalFromQuery) {
                                 itemsSoFar = totalFromQuery;
                             }
@@ -1051,18 +1073,19 @@ class query extends viewModelBase {
                             this.totalResultsForUi(this.hasMoreUnboundedResults() ? itemsSoFar - 1 : itemsSoFar);
                         }
                         
-                        if (queryResults.additionalResultInfo.SkippedResults) {
+                        if (queryResults.additionalResultInfo.SkippedResults || filterByQuery) {
                             // apply skipped results (if any)
                             totalSkippedResults += queryResults.additionalResultInfo.SkippedResults;
                             
                             // find if query contains positive offset or limit, if so warn about paging.
+                            // eslint-disable-next-line @typescript-eslint/no-unused-vars
                             const [_, rqlWithoutParameters] = queryCommand.extractQueryParameters(criteriaForFetcher.queryText());
                             if (/\s+(offset|limit)\s+/img.test(rqlWithoutParameters)) {
                                 this.showFanOutWarning(true);
                             }
                         }
                         
-                        if (totalSkippedResults) {
+                        if (totalSkippedResults || filterByQuery) {
                             queryResults.totalResultCount = skip + queryResults.items.length;
                             if (queryResults.items.length === take + 1) {
                                 queryResults.totalResultCount += 30;
@@ -1153,6 +1176,18 @@ class query extends viewModelBase {
             this.queryFetcher(resultsFetcher);
             this.updateBrowserUrl(this.criteria());
         }
+    }
+    
+    onQueryRun() {
+        this.killQueryTimeoutId = setTimeout(() => {
+            this.showKillQueryButton(true);
+        }, 5000);
+    }
+    
+    afterQueryRun() {
+        clearTimeout(this.killQueryTimeoutId);
+        this.killQueryTimeoutId = -1;
+        this.showKillQueryButton(false);
     }
     
     explainIndex(): void {
@@ -1653,7 +1688,7 @@ class query extends viewModelBase {
             const latitudeProperty = spatialProperties[i].LatitudeProperty;
             const longitudeProperty = spatialProperties[i].LongitudeProperty;
 
-            let pointsArray: geoPointInfo[] = [];
+            const pointsArray: geoPointInfo[] = [];
             for (let i = 0; i < this.allSpatialResultsItems().length; i++) {
                 const item = this.allSpatialResultsItems()[i];
 
@@ -1748,11 +1783,11 @@ class query extends viewModelBase {
     private exportCsvInternal(columns?: string[]): void {
         eventsCollector.default.reportEvent("query", "export-csv");
 
-        let args: { format: string, debug?: string, field?: string[] };
-        if (this.criteria().indexEntries()) {
-            args = { format: "csv", debug: "entries", field: columns };
-        } else {
-            args = { format: "csv", field: columns };
+        const args = {
+            format: "csv",
+            field: columns,
+            debug: this.criteria().indexEntries() ? "entries" : undefined,
+            includeLimit: this.criteria().ignoreIndexQueryLimit() ? "true" : undefined
         }
         
         let payload: { Query: string };

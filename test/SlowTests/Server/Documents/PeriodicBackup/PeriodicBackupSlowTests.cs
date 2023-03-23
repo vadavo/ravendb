@@ -18,6 +18,7 @@ using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.CompareExchange;
+using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Documents.Operations.OngoingTasks;
 using Raven.Client.Documents.Operations.TimeSeries;
 using Raven.Client.Documents.Session;
@@ -529,11 +530,89 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     {
                         var databaseChangeVector = DocumentsStorage.GetDatabaseChangeVector(ctx);
                         Assert.Contains($"A:8-{originalDatabase.DbBase64Id}", databaseChangeVector);
-                        Assert.Contains($"A:10-{restoredDatabase.DbBase64Id}", databaseChangeVector);
+                        Assert.Contains($"A:11-{restoredDatabase.DbBase64Id}", databaseChangeVector);
                     }
                 }
             }
         }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task CanBackupAndRestoreSnapshotExcludingIndexes()
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            string restoredDatabaseName = $"restored_database_snapshot-{Guid.NewGuid()}";
+
+            using (var store = GetDocumentStore())
+            {
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "Lev1" }, "users/1");
+                    await session.StoreAsync(new User { Name = "Lev2" }, "users/2");
+                    await session.StoreAsync(new User { Name = "Lev3" }, "users/3");
+                    await session.SaveChangesAsync();
+                }
+
+                var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
+                Assert.Equal(0, stats.CountOfIndexes);
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session
+                        .Query<User>()
+                        .Where(x => x.Name == "Lev")
+                        .ToListAsync(); // create an index to backup
+
+                    await session
+                        .Query<Order>()
+                        .Where(x => x.Freight > 5)
+                        .ToListAsync(); // create an index to backup
+
+                    await session.SaveChangesAsync();
+                }
+
+                stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
+                Assert.Equal(2, stats.CountOfIndexes);
+
+                var config = Backup.CreateBackupConfiguration(backupPath, backupType: BackupType.Snapshot);
+                config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.Fastest, ExcludeIndexes = false };
+                await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                // check that backup file consist Indexes folder
+                var backupLocation = Directory.GetDirectories(backupPath).First();
+                using (ReadOnly(backupLocation))
+                {
+                    var backupFile = Directory.GetFiles(backupLocation).First();
+                    using (ZipArchive archive = ZipFile.OpenRead(backupFile))
+                        Assert.True(archive.Entries.Any(entry => entry.FullName.Contains("Indexes")));
+                }
+
+                Directory.Delete(backupLocation, true);
+                Assert.False(Directory.Exists(backupLocation));
+
+                config.SnapshotSettings.ExcludeIndexes = true;
+                await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                backupLocation = Directory.GetDirectories(backupPath).First();
+                using (ReadOnly(backupLocation))
+                {
+                    var backupFile = Directory.GetFiles(backupLocation).First();
+
+                    using (ZipArchive archive = ZipFile.OpenRead(backupFile))
+                        Assert.False(archive.Entries.Any(entry => entry.FullName.Contains("Indexes")));
+
+                    using (Backup.RestoreDatabase(store, new RestoreBackupConfiguration { BackupLocation = backupLocation, DatabaseName = restoredDatabaseName }))
+                    using (var session = store.OpenAsyncSession(restoredDatabaseName))
+                    {
+                        var users = await session.LoadAsync<User>(new[] { "users/1", "users/2" });
+                        Assert.NotNull(users["users/1"]);
+                        Assert.NotNull(users["users/2"]);
+                        Assert.True(users.Any(x => x.Value.Name == "Lev1"));
+                        Assert.True(users.Any(x => x.Value.Name == "Lev2"));
+                    }
+                }
+            }
+        }
+
 
         [Theory, Trait("Category", "Smuggler")]
         [InlineData(BackupType.Snapshot)]
@@ -1774,7 +1853,9 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     using (ctx.OpenReadTransaction())
                     {
                         var databaseChangeVector = DocumentsStorage.GetDatabaseChangeVector(ctx);
-                        Assert.Equal($"A:4-{originalDatabase.DbBase64Id}", databaseChangeVector);
+                        var expected1 = $"A:5-{restoredDatabase.DbBase64Id}, A:4-{originalDatabase.DbBase64Id}";
+                        var expected2 = $"A:4-{originalDatabase.DbBase64Id}, A:5-{restoredDatabase.DbBase64Id}";
+                        Assert.True(databaseChangeVector == expected1 || databaseChangeVector == expected2, $"Expected:\t\"{databaseChangeVector}\"\nActual:\t\"{expected1}\" or \"{expected2}\"\n");
                     }
                 }
             }
@@ -2905,6 +2986,72 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 {
                     var user = await session.LoadAsync<User>(docId);
                     Assert.Null(user);
+                }
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task can_backup_and_restore_cluster_transactions_with_document_collection_change()
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using (var store = GetDocumentStore())
+            {
+                const string id = "users/1";
+                const string country = "Israel";
+
+                using (var session = store.OpenAsyncSession(new SessionOptions
+                {
+                    TransactionMode = TransactionMode.ClusterWide
+                }))
+                {
+                    await session.StoreAsync(new User
+                    {
+                        Name = "Grisha"
+                    }, id);
+                    await session.SaveChangesAsync();
+                }
+
+                var config = Backup.CreateBackupConfiguration(backupPath);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                using (var session = store.OpenAsyncSession(new SessionOptions
+                {
+                    TransactionMode = TransactionMode.ClusterWide
+                }))
+                {
+                    session.Delete("users/1");
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession(new SessionOptions
+                {
+                    TransactionMode = TransactionMode.ClusterWide
+                }))
+                {
+                    await session.StoreAsync(new Address
+                    {
+                        Country = country
+                    }, id);
+                    await session.SaveChangesAsync();
+                }
+
+                await Backup.RunBackupAndReturnStatusAsync(Server, backupTaskId, store, isFullBackup: false, expectedEtag: 4);
+
+                var databaseName = $"restored_database-{Guid.NewGuid()}";
+
+                using (Backup.RestoreDatabase(store,
+                           new RestoreBackupConfiguration
+                           {
+                               BackupLocation = Directory.GetDirectories(backupPath).First(),
+                               DatabaseName = databaseName
+                           }))
+                {
+                    using (var session = store.OpenAsyncSession())
+                    {
+                        var address = await session.LoadAsync<Address>(id);
+                        Assert.NotNull(address);
+                        Assert.Equal(country, address.Country);
+                    }
                 }
             }
         }

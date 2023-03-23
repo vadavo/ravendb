@@ -63,6 +63,17 @@ namespace Raven.Client.Exceptions
             return exception;
         }
 
+        public static Exception Get(BlittableJsonReaderObject json, HttpStatusCode code, Exception inner = null)
+        {
+            var schema = GetExceptionSchema(code, json);
+
+            var exception = Get(schema, code, inner);
+
+            FillException(exception, json);
+
+            return exception;
+        }
+
         public static async Task Throw(JsonOperationContext context, HttpResponseMessage response, Action<StringBuilder> additionalErrorInfo = null)
         {
             if (response == null)
@@ -71,7 +82,7 @@ namespace Raven.Client.Exceptions
             using (var stream = await RequestExecutor.ReadAsStreamUncompressedAsync(response).ConfigureAwait(false))
             using (var json = await GetJson(context, response, stream).ConfigureAwait(false))
             {
-                var schema = GetExceptionSchema(response, json);
+                var schema = GetExceptionSchema(response.StatusCode, json);
 
                 if (response.StatusCode == HttpStatusCode.Conflict)
                 {
@@ -107,16 +118,23 @@ namespace Raven.Client.Exceptions
                 if (typeof(RavenException).IsAssignableFrom(type) == false)
                     throw new RavenException(schema.Error, exception);
 
-                if (type == typeof(IndexCompilationException))
-                {
-                    var indexCompilationException = (IndexCompilationException)exception;
-                    json.TryGet(nameof(IndexCompilationException.IndexDefinitionProperty), out indexCompilationException.IndexDefinitionProperty);
-                    json.TryGet(nameof(IndexCompilationException.ProblematicText), out indexCompilationException.ProblematicText);
-
-                    throw indexCompilationException;
-                }
+                FillException(exception, json);
 
                 throw exception;
+            }
+        }
+
+        private static void FillException(Exception exception, BlittableJsonReaderObject json)
+        {
+            switch (exception)
+            {
+                case IndexCompilationException indexCompilationException:
+                    json.TryGet(nameof(IndexCompilationException.IndexDefinitionProperty), out indexCompilationException.IndexDefinitionProperty);
+                    json.TryGet(nameof(IndexCompilationException.ProblematicText), out indexCompilationException.ProblematicText);
+                    break;
+                case RavenTimeoutException timeoutException:
+                    json.TryGet(nameof(RavenTimeoutException.FailImmediately), out timeoutException.FailImmediately);
+                    break;
             }
         }
 
@@ -184,7 +202,7 @@ namespace Raven.Client.Exceptions
             return Type.GetType(typeAsString, throwOnError: false);
         }
 
-        private static ExceptionSchema GetExceptionSchema(HttpResponseMessage response, BlittableJsonReaderObject json)
+        private static ExceptionSchema GetExceptionSchema(HttpStatusCode code, BlittableJsonReaderObject json)
         {
             ExceptionSchema schema;
             try
@@ -193,45 +211,49 @@ namespace Raven.Client.Exceptions
             }
             catch (Exception e)
             {
-                throw new InvalidOperationException($"Cannot deserialize the {response.StatusCode} response. JSON: {json}", e);
+                throw new InvalidOperationException($"Cannot deserialize the {code} response. JSON: {json}", e);
             }
 
             if (schema == null)
-                throw new BadResponseException($"After deserialization the {response.StatusCode} response is null. JSON: {json}");
+                throw new BadResponseException($"After deserialization the {code} response is null. JSON: {json}");
 
             if (schema.Message == null)
-                throw new BadResponseException($"After deserialization the {response.StatusCode} response property '{nameof(schema.Message)}' is null. JSON: {json}");
+                throw new BadResponseException($"After deserialization the {code} response property '{nameof(schema.Message)}' is null. JSON: {json}");
 
             if (schema.Error == null)
-                throw new BadResponseException($"After deserialization the {response.StatusCode} response property '{nameof(schema.Error)}' is null. JSON: {json}");
+                throw new BadResponseException($"After deserialization the {code} response property '{nameof(schema.Error)}' is null. JSON: {json}");
 
             if (schema.Type == null)
-                throw new BadResponseException($"After deserialization the {response.StatusCode} response property '{nameof(schema.Type)}' is null. JSON: {json}");
+                throw new BadResponseException($"After deserialization the {code} response property '{nameof(schema.Type)}' is null. JSON: {json}");
 
             return schema;
         }
 
         private static async Task<BlittableJsonReaderObject> GetJson(JsonOperationContext context, HttpResponseMessage response, Stream stream)
         {
+            var ms = context.CheckoutMemoryStream();
+
             BlittableJsonReaderObject json;
+
             try
             {
-                json = await context.ReadForMemoryAsync(stream, "error/response").ConfigureAwait(false);
+                // copying the error stream so we can read it as string if we fail to parse it
+                await stream.CopyToAsync(ms).ConfigureAwait(false);
+                ms.Position = 0;
+                json = await context.ReadForMemoryAsync(ms, "error/response").ConfigureAwait(false);
             }
             catch (Exception e)
             {
-                string content = null;
-                if (stream.CanSeek)
-                {
-                    stream.Position = 0;
-                    using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true))
-                        content = await reader.ReadToEndAsync().ConfigureAwait(false);
-                }
-
-                if (content != null)
-                    content = $"Content: {content}";
+                string content = "Content: ";
+                ms.Position = 0;
+                using (var reader = new StreamReader(ms, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true))
+                    content += await reader.ReadToEndAsync().ConfigureAwait(false);
 
                 throw new InvalidOperationException($"Cannot parse the '{response.StatusCode}' response. {content}", e);
+            }
+            finally
+            {
+                context.ReturnMemoryStream(ms);
             }
 
             return json;

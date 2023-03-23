@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Lextm.SharpSnmpLib.Pipeline;
 using Raven.Client.Documents.Changes;
+using Raven.Client.Exceptions.Database;
 using Raven.Client.Util;
 using Raven.Server.Documents;
 using Raven.Server.Monitoring.Snmp.Objects.Database;
@@ -91,6 +92,11 @@ namespace Raven.Server.Monitoring.Snmp
             _objectStore.Add(new DatabaseIndexStorageUsedSize(_databaseName, _databaseLandlord, _databaseIndex));
             _objectStore.Add(new DatabaseTotalStorageSize(_databaseName, _databaseLandlord, _databaseIndex));
             _objectStore.Add(new DatabaseStorageDiskRemainingSpace(_databaseName, _databaseLandlord, _databaseIndex));
+            _objectStore.Add(new DatabaseStorageDiskIosReadOperations(_databaseName, _databaseLandlord, _databaseIndex));
+            _objectStore.Add(new DatabaseStorageDiskIosWriteOperations(_databaseName, _databaseLandlord, _databaseIndex));
+            _objectStore.Add(new DatabaseStorageDiskReadThroughput(_databaseName, _databaseLandlord, _databaseIndex));
+            _objectStore.Add(new DatabaseStorageDiskWriteThroughput(_databaseName, _databaseLandlord, _databaseIndex));
+            _objectStore.Add(new DatabaseStorageDiskQueueLength(_databaseName, _databaseLandlord, _databaseIndex));
 
             _objectStore.Add(new DatabaseWritesPerSecond(_databaseName, _databaseLandlord, _databaseIndex));
             _objectStore.Add(new DatabaseDataWrittenPerSecond(_databaseName, _databaseLandlord, _databaseIndex));
@@ -119,6 +125,10 @@ namespace Raven.Server.Monitoring.Snmp
                     await AddIndexesFromDatabase(database);
 
                     _attached = true;
+                }
+                catch (DatabaseDisabledException)
+                {
+                    // ignored
                 }
                 finally
                 {

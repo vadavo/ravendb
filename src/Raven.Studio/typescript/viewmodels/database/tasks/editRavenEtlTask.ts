@@ -22,8 +22,6 @@ import documentMetadata = require("models/database/documents/documentMetadata");
 import getDocumentWithMetadataCommand = require("commands/database/documents/getDocumentWithMetadataCommand");
 import document = require("models/database/documents/document");
 import testRavenEtlCommand = require("commands/database/tasks/testRavenEtlCommand");
-import popoverUtils = require("common/popoverUtils");
-import tasksCommonContent = require("models/database/tasks/tasksCommonContent");
 import discoveryUrl = require("models/database/settings/discoveryUrl");
 import { highlight, languages } from "prismjs";
 
@@ -173,6 +171,8 @@ class editRavenEtlTask extends viewModelBase {
     view = require("views/database/tasks/editRavenEtlTask.html");
     connectionStringView = require("views/database/settings/connectionStringRaven.html")
     certificateUploadInfoForOngoingTasks = require("views/partial/certificateUploadInfoForOngoingTasks.html");
+    pinResponsibleNodeButtonsScriptView = require("views/partial/pinResponsibleNodeButtonsScript.html");
+    pinResponsibleNodeTextScriptView = require("views/partial/pinResponsibleNodeTextScript.html");
     
     static readonly scriptNamePrefix = "Script_";
     static isApplyToAll = ongoingTaskRavenEtlTransformationModel.isApplyToAll;
@@ -258,11 +258,6 @@ class editRavenEtlTask extends viewModelBase {
         super.compositionComplete();
 
         $('.edit-raven-etl-task [data-toggle="tooltip"]').tooltip();
-
-        popoverUtils.longWithHover($(".responsible-node"),
-            {
-                content: tasksCommonContent.responsibleNodeInfo
-            });
     }
 
     private getAllConnectionStrings() {
@@ -358,7 +353,7 @@ class editRavenEtlTask extends viewModelBase {
     saveRavenEtl() {
         let hasAnyErrors = false;
         this.spinners.save(true);
-        let editedEtl = this.editedRavenEtl();
+        const editedEtl = this.editedRavenEtl();
 
         // 0. Save discovery URL if user forgot to hit 'add url' button
         if (this.createNewConnectionString() && 
@@ -397,7 +392,7 @@ class editRavenEtlTask extends viewModelBase {
         }
 
         // 4. All is well, Save connection string (if relevant..) 
-        let savingNewStringAction = $.Deferred<void>();
+        const savingNewStringAction = $.Deferred<void>();
         if (this.createNewConnectionString()) {
             this.newConnectionString()
                 .saveConnectionString(this.activeDatabase())

@@ -12,8 +12,8 @@ using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 using Sparrow.Server.Json.Sync;
-using Sparrow.Server.Utils;
 using Sparrow.Threading;
+using Sparrow.Utils;
 
 namespace Raven.Server.Rachis.Remote
 {
@@ -62,9 +62,14 @@ namespace Raven.Server.Rachis.Remote
             public string Destination;
             public int Number;
             public long Term;
+
+            public DateTime LastSent;
+            public DateTime LastReceived;
         }
 
         private RemoteConnectionInfo _info;
+        public RemoteConnectionInfo Info => _info;
+
         private static int _connectionNumber = 0;
         public static ConcurrentSet<RemoteConnectionInfo> RemoteConnectionsList = new ConcurrentSet<RemoteConnectionInfo>();
 
@@ -102,6 +107,7 @@ namespace Raven.Server.Rachis.Remote
             using (var writer = new RachisBlittableJsonTextWriter(context, _stream, afterFlush))
             {
                 context.Write(writer, msg);
+                _info.LastSent = DateTime.UtcNow;
             }
         }
 
@@ -306,6 +312,8 @@ namespace Raven.Server.Rachis.Remote
             {
                 json.BlittableValidation();
                 ValidateMessage(typeof(T).Name, json);
+                
+                _info.LastReceived = DateTime.UtcNow;
                 return JsonDeserializationRachis<T>.Deserialize(json);
             }
         }
@@ -356,9 +364,9 @@ namespace Raven.Server.Rachis.Remote
             }
         }
 
-        public void Send(JsonOperationContext context, AppendEntriesResponse aer)
+        public void Send(JsonOperationContext context, AppendEntriesResponse aer, bool shouldLog=true)
         {
-            if (_log.IsInfoEnabled)
+            if (_log.IsInfoEnabled && shouldLog)
             {
                 _log.Info(aer.ToString());
             }
@@ -384,6 +392,17 @@ namespace Raven.Server.Rachis.Remote
 
         private void DisposeInternal()
         {
+            try
+            {
+                //  we dispose here the stream explicitly to avoid waiting indefinitely on the stream.Read method
+                // which will prevent us continue the dispose, since the Read is wrapped with _disposerLock.EnsureNotDisposed()
+                _stream?.Dispose();
+            }
+            catch
+            {
+                // don't care
+            }
+
             using (_disposerLock.StartDisposing())
             {
                 RemoteConnectionsList.TryRemove(_info);

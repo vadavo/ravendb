@@ -7,6 +7,7 @@ using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using Raven.Client;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.ConnectionStrings;
@@ -53,7 +54,7 @@ namespace Raven.Server.Web.System
             var result = GetOngoingTasksInternal();
 
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
-            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
             {
                 context.Write(writer, result.ToJson());
             }
@@ -159,6 +160,7 @@ namespace Raven.Server.Web.System
                 DestinationUrl = res.Url,
                 TopologyDiscoveryUrls = connection?.TopologyDiscoveryUrls,
                 MentorNode = sinkReplication.MentorNode,
+                PinToMentorNode = sinkReplication.PinToMentorNode,
                 TaskConnectionStatus = res.Status,
                 AccessName = sinkReplication.AccessName,
                 AllowedHubToSinkPaths = sinkReplication.AllowedHubToSinkPaths,
@@ -169,9 +171,9 @@ namespace Raven.Server.Web.System
             {
                 // fetch public key of certificate
                 var certBytes = Convert.FromBase64String(sinkReplication.CertificateWithPrivateKey);
-                var certificate = new X509Certificate2(certBytes,
+                var certificate = CertificateLoaderUtil.CreateCertificate(certBytes,
                     sinkReplication.CertificatePassword,
-                    X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+                    CertificateLoaderUtil.FlagsForExport);
 
                 sinkInfo.CertificatePublicKey = Convert.ToBase64String(certificate.Export(X509ContentType.Cert));
             }
@@ -206,6 +208,7 @@ namespace Raven.Server.Web.System
                 DestinationDatabase = ex.Database,
                 DestinationUrl = connectionResult.Url,
                 MentorNode = ex.MentorNode,
+                PinToMentorNode = ex.PinToMentorNode,
                 TaskConnectionStatus = connectionResult.Status,
                 DelayReplicationFor = ex.DelayReplicationFor
             };
@@ -296,6 +299,7 @@ namespace Raven.Server.Web.System
                 DestinationUrl = res.Url,
                 TopologyDiscoveryUrls = connection?.TopologyDiscoveryUrls,
                 MentorNode = watcher.MentorNode,
+                PinToMentorNode = watcher.PinToMentorNode,
                 TaskConnectionStatus = res.Status,
                 DelayReplicationFor = watcher.DelayReplicationFor
             };
@@ -440,7 +444,7 @@ namespace Raven.Server.Web.System
                 var backupConfiguration = JsonDeserializationServer.BackupConfiguration(json);
                 var backupName = $"One Time Backup #{Interlocked.Increment(ref _oneTimeBackupCounter)}";
 
-                PeriodicBackupRunner.CheckServerHealthBeforeBackup(ServerStore, backupName);
+                BackupUtils.CheckServerHealthBeforeBackup(ServerStore, backupName);
                 ServerStore.LicenseManager.AssertCanAddPeriodicBackup(backupConfiguration);
                 BackupConfigurationHelper.AssertBackupConfigurationInternal(backupConfiguration);
                 BackupConfigurationHelper.AssertDestinationAndRegionAreAllowed(backupConfiguration, ServerStore);
@@ -460,11 +464,12 @@ namespace Raven.Server.Web.System
                         OperationId = operationId,
                         BackupToLocalFolder = BackupConfiguration.CanBackupUsing(backupConfiguration.LocalSettings),
                         IsFullBackup = true,
-                        TempBackupPath = (Database.Configuration.Storage.TempPath ?? Database.Configuration.Core.DataDirectory).Combine("OneTimeBackupTemp"),
+                        TempBackupPath = BackupUtils.GetBackupTempPath(Database.Configuration, "OneTimeBackupTemp"),
                         Name = backupName
                     };
 
                     var backupTask = new BackupTask(Database, backupParameters, backupConfiguration, Logger);
+                    var threadName = $"Backup thread {backupName} for database '{Database.Name}'";
 
                     var t = Database.Operations.AddOperation(
                         null,
@@ -477,7 +482,7 @@ namespace Raven.Server.Web.System
                             {
                                 try
                                 {
-                                    Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                                    ThreadHelper.TrySetThreadPriority(ThreadPriority.BelowNormal, threadName, Logger);
                                     NativeMemory.EnsureRegistered();
 
                                     using (Database.PreventFromUnloadingByIdleOperations())
@@ -503,7 +508,7 @@ namespace Raven.Server.Web.System
                                 {
                                     ServerStore.ConcurrentBackupsCounter.FinishBackup(backupName, backupStatus: null, sw.Elapsed, Logger);
                                 }
-                            }, null, $"Backup thread {backupName} for database '{Database.Name}'");
+                            }, null, threadName);
                             return tcs.Task;
                         },
                         id: operationId, token: cancelToken);
@@ -574,6 +579,7 @@ namespace Raven.Server.Web.System
                 TaskName = backupConfiguration.Name,
                 TaskState = backupConfiguration.Disabled ? OngoingTaskState.Disabled : OngoingTaskState.Enabled,
                 MentorNode = backupConfiguration.MentorNode,
+                PinToMentorNode = backupConfiguration.PinToMentorNode,
                 LastExecutingNodeTag = backupStatus.NodeTag,
                 LastFullBackup = backupStatus.LastFullBackup,
                 LastIncrementalBackup = backupStatus.LastIncrementalBackup,
@@ -838,6 +844,7 @@ namespace Raven.Server.Web.System
                         TaskName = ravenEtl.Name,
                         TaskState = taskState,
                         MentorNode = ravenEtl.MentorNode,
+                        PinToMentorNode = ravenEtl.PinToMentorNode,
                         ResponsibleNode = new NodeId
                         {
                             NodeTag = tag,
@@ -1082,8 +1089,8 @@ namespace Raven.Server.Web.System
                             {
                                 TaskId = sqlEtl.TaskId,
                                 TaskName = sqlEtl.Name,
-                                MentorNode = sqlEtl.MentorNode,
                                 Configuration = sqlEtl,
+                                MentorNode = sqlEtl.MentorNode,
                                 TaskState = GetEtlTaskState(sqlEtl),
                                 TaskConnectionStatus = GetEtlTaskConnectionStatus(record, sqlEtl, out var sqlNode, out var sqlEtlError),
                                 ResponsibleNode = new NodeId
@@ -1225,6 +1232,7 @@ namespace Raven.Server.Web.System
                                 Disabled = subscriptionState.Disabled,
                                 LastClientConnectionTime = subscriptionState.LastClientConnectionTime,
                                 MentorNode = subscriptionState.MentorNode,
+                                PinToMentorNode = subscriptionState.PinToMentorNode,
                                 ResponsibleNode = new NodeId
                                 {
                                     NodeTag = tag,

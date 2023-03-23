@@ -111,6 +111,7 @@ namespace RachisTests.DatabaseCluster
                 var doc = new DatabaseRecord(databaseName);
                 databaseResult = await store.Maintenance.Server.SendAsync(new CreateDatabaseOperation(doc, clusterSize));
             }
+            
             Assert.Equal(clusterSize, databaseResult.Topology.AllNodes.Count());
             foreach (var server in Servers)
             {
@@ -1179,7 +1180,9 @@ namespace RachisTests.DatabaseCluster
                     }
 
                     await Task.Delay(3000); // wait for cleanup
-                    cluster.Leader.ServerStore.Observer.Suspended = true;
+
+                    Cluster.SuspendObserver(cluster.Leader);
+
                     await store.Maintenance.Server.SendAsync(new AddDatabaseNodeOperation(store.Database));
 
                     using (var session = store.OpenSession(new SessionOptions { TransactionMode = TransactionMode.ClusterWide }))

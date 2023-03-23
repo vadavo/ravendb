@@ -138,7 +138,7 @@ class indexErrors extends viewModelBase {
         super.compositionComplete();
         const grid = this.gridController();
         grid.headerVisible(true);
-        grid.init((s, t) => this.fetchIndexErrors(s, t), () =>
+        grid.init(() => this.fetchIndexErrors(), () =>
             [
                 new actionColumn<IndexErrorPerDocument>(grid, (error, index) => this.showErrorDetails(index), "Show", `<i class="icon-preview"></i>`, "72px",
                     {
@@ -152,7 +152,7 @@ class indexErrors extends viewModelBase {
                     sortable: "string",
                     customComparator: generalUtils.sortAlphaNumeric
                 }),
-                new textColumn<IndexErrorPerDocument>(grid, x => generalUtils.formatUtcDateAsLocal(x.Timestamp), "Date", "20%", {
+                new textColumn<IndexErrorPerDocument>(grid, x => x.LocalTime, "Date", "20%", {
                     sortable: "string"
                 }),
                 new textColumn<IndexErrorPerDocument>(grid, x => x.Action, "Action", "10%", {
@@ -197,7 +197,7 @@ class indexErrors extends viewModelBase {
         this.gridController().reset(false);
     }
 
-    private fetchIndexErrors(start: number, take: number): JQueryPromise<pagedResult<IndexErrorPerDocument>> {
+    private fetchIndexErrors(): JQueryPromise<pagedResult<IndexErrorPerDocument>> {
         if (this.allIndexErrors === null) {
             return this.fetchRemoteIndexesError().then(list => {
                 this.allIndexErrors = list;
@@ -283,7 +283,7 @@ class indexErrors extends viewModelBase {
             });
 
         const mappedReducedItems: indexActionAndCount[] = mappedItems.reduce((result: indexActionAndCount[], next: indexActionAndCount) => {
-            var existing = result.find(x => x.actionName === next.actionName);
+            const existing = result.find(x => x.actionName === next.actionName);
             if (existing) {
                 existing.count += next.count;
             } else {
@@ -299,11 +299,13 @@ class indexErrors extends viewModelBase {
         const mappedItems = _.flatMap(indexErrors, value => {
             return value.Errors.map((error: Raven.Client.Documents.Indexes.IndexingError): IndexErrorPerDocument =>
                 ({
-                    Timestamp: error.Timestamp,
+                    Timestamp: moment.utc(error.Timestamp).format(),
                     Document: error.Document,
                     Action: error.Action,
                     Error: error.Error,
-                    IndexName: value.Name
+                    IndexName: value.Name,
+                    LocalTime: generalUtils.formatUtcDateAsLocal(error.Timestamp),
+                    RelativeTime: generalUtils.formatDurationByDate(moment.utc(error.Timestamp), true)
                 }));
         });
         

@@ -11,6 +11,7 @@ using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.ETL;
 using Raven.Client.Documents.Operations.ETL.OLAP;
 using Raven.Client.Documents.Operations.ETL.SQL;
+using Raven.Client.Documents.Operations.ETL.ElasticSearch;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Json.Serialization;
@@ -144,12 +145,12 @@ namespace Raven.Server.Dashboard
                         var trafficWatchItem = new TrafficWatchItem
                         {
                             Database = database.Name,
-                            RequestsPerSecond = (int)database.Metrics.Requests.RequestsPerSec.GetRate(rate),
+                            RequestsPerSecond = (int)Math.Ceiling(database.Metrics.Requests.RequestsPerSec.GetRate(rate)),
                             AverageRequestDuration = database.Metrics.Requests.AverageDuration.GetRate(),
-                            DocumentWritesPerSecond = (int)database.Metrics.Docs.PutsPerSec.GetRate(rate),
-                            AttachmentWritesPerSecond = (int)database.Metrics.Attachments.PutsPerSec.GetRate(rate),
-                            CounterWritesPerSecond = (int)database.Metrics.Counters.PutsPerSec.GetRate(rate),
-                            TimeSeriesWritesPerSecond = (int)database.Metrics.TimeSeries.PutsPerSec.GetRate(rate),
+                            DocumentWritesPerSecond = (int)Math.Ceiling(database.Metrics.Docs.PutsPerSec.GetRate(rate)),
+                            AttachmentWritesPerSecond = (int)Math.Ceiling(database.Metrics.Attachments.PutsPerSec.GetRate(rate)),
+                            CounterWritesPerSecond = (int)Math.Ceiling(database.Metrics.Counters.PutsPerSec.GetRate(rate)),
+                            TimeSeriesWritesPerSecond = (int)Math.Ceiling(database.Metrics.TimeSeries.PutsPerSec.GetRate(rate)),
                             DocumentsWriteBytesPerSecond = database.Metrics.Docs.BytesPutsPerSec.GetRate(rate),
                             AttachmentsWriteBytesPerSecond = database.Metrics.Attachments.BytesPutsPerSec.GetRate(rate),
                             CountersWriteBytesPerSecond = database.Metrics.Counters.BytesPutsPerSec.GetRate(rate),
@@ -240,7 +241,7 @@ namespace Raven.Server.Dashboard
 
                         // Get new data
                         var systemEnv = new StorageEnvironmentWithType("<System>", StorageEnvironmentWithType.StorageEnvironmentType.System, serverStore._env);
-                        var systemMountPoints = ServerStore.GetMountPointUsageDetailsFor(systemEnv, includeTempBuffers: true);
+                        var systemMountPoints = serverStore.GetMountPointUsageDetailsFor(systemEnv, includeTempBuffers: true);
 
                         foreach (var systemPoint in systemMountPoints)
                         {
@@ -253,9 +254,13 @@ namespace Raven.Server.Dashboard
                     }
                     else
                     {
-                        // Use existing data
+                        // Use existing data but update IO stats (which has separate cache)
                         foreach (var systemPoint in cachedSystemInfoCopy.MountPoints)
                         {
+                            var driveInfo = systemPoint.DiskSpaceResult.DriveName;
+                            var ioStatsResult = serverStore.Server.DiskStatsGetter.Get(driveInfo);
+                            if (ioStatsResult != null)
+                                systemPoint.IoStatsResult = ServerStore.FillIoStatsResult(ioStatsResult); 
                             UpdateMountPoint(serverStore.Configuration.Storage, systemPoint, "<System>", drivesUsage);
                         }
                     }
@@ -295,6 +300,10 @@ namespace Raven.Server.Dashboard
             var sqlEtlCount = database.EtlLoader.SqlDestinations.Count;
             long sqlEtlCountOnNode = GetTaskCountOnNode<SqlEtlConfiguration>(database, dbRecord, serverStore, database.EtlLoader.SqlDestinations,
                 task => EtlLoader.GetProcessState(task.Transforms, database, task.Name));
+            
+            var elasticSearchEtlCount = database.EtlLoader.ElasticSearchDestinations.Count;
+            long elasticSearchEtlCountOnNode = GetTaskCountOnNode<ElasticSearchEtlConfiguration>(database, dbRecord, serverStore, database.EtlLoader.ElasticSearchDestinations,
+                task => EtlLoader.GetProcessState(task.Transforms, database,task.Name));
 
             var olapEtlCount = database.EtlLoader.OlapDestinations.Count;
             long olapEtlCountOnNode = GetTaskCountOnNode<OlapEtlConfiguration>(database, dbRecord, serverStore, database.EtlLoader.OlapDestinations,
@@ -310,7 +319,7 @@ namespace Raven.Server.Dashboard
             long subscriptionCountOnNode = GetSubscriptionCountOnNode(database, dbRecord, serverStore, context);
 
             ongoingTasksCount = extRepCount + replicationHubCount + replicationSinkCount +
-                                ravenEtlCount + sqlEtlCount + olapEtlCount + periodicBackupCount + subscriptionCount;
+                                ravenEtlCount + sqlEtlCount + elasticSearchEtlCount + olapEtlCount + periodicBackupCount + subscriptionCount;
             
             return new DatabaseOngoingTasksInfoItem()
             {
@@ -320,6 +329,7 @@ namespace Raven.Server.Dashboard
                 ReplicationSinkCount = replicationSinkCountOnNode,
                 RavenEtlCount = ravenEtlCountOnNode,
                 SqlEtlCount = sqlEtlCountOnNode,
+                ElasticSearchEtlCount = elasticSearchEtlCountOnNode,
                 OlapEtlCount = olapEtlCountOnNode,
                 PeriodicBackupCount = periodicBackupCountOnNode,
                 SubscriptionCount = subscriptionCountOnNode
@@ -413,6 +423,7 @@ namespace Raven.Server.Dashboard
             usage.VolumeLabel = mountPointUsage.DiskSpaceResult.VolumeLabel;
             usage.FreeSpace = mountPointUsage.DiskSpaceResult.TotalFreeSpaceInBytes;
             usage.TotalCapacity = mountPointUsage.DiskSpaceResult.TotalSizeInBytes;
+            usage.IoStatsResult = mountPointUsage.IoStatsResult;
             usage.IsLowSpace = StorageSpaceMonitor.IsLowSpace(new Size(usage.FreeSpace, SizeUnit.Bytes), new Size(usage.TotalCapacity, SizeUnit.Bytes), storageConfiguration, out string _);
 
             var existingDatabaseUsage = usage.Items.FirstOrDefault(x => x.Database == databaseName);
@@ -492,7 +503,7 @@ namespace Raven.Server.Dashboard
             foreach (var mountPointUsage in databaseInfo.MountPointsUsage)
             {
                 var driveName = mountPointUsage.DiskSpaceResult.DriveName;
-                var diskSpaceResult = DiskSpaceChecker.GetDiskSpaceInfo(
+                var diskSpaceResult = DiskUtils.GetDiskSpaceInfo(
                     mountPointUsage.DiskSpaceResult.DriveName,
                     new DriveInfoBase
                     {
@@ -510,7 +521,20 @@ namespace Raven.Server.Dashboard
                         TotalSizeInBytes = diskSpaceResult.TotalSize.GetValue(SizeUnit.Bytes)
                     };
                 }
-
+                
+                var diskStatsResult = serverStore.Server.DiskStatsGetter.Get(driveName);
+                if (diskStatsResult != null)
+                {
+                    mountPointUsage.IoStatsResult = new IoStatsResult
+                    {
+                        IoReadOperations = diskStatsResult.IoReadOperations,
+                        IoWriteOperations = diskStatsResult.IoWriteOperations,
+                        ReadThroughputInKb = diskStatsResult.ReadThroughput.GetValue(SizeUnit.Kilobytes),
+                        WriteThroughputInKb = diskStatsResult.WriteThroughput.GetValue(SizeUnit.Kilobytes),
+                        QueueLength = diskStatsResult.QueueLength,
+                    };
+                }
+                
                 UpdateMountPoint(serverStore.Configuration.Storage, mountPointUsage, databaseName, existingDrivesUsage);
             }
         }

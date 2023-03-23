@@ -17,8 +17,8 @@ class licenseWidget extends widget {
 
     view = require("views/resources/widgets/licenseWidget.html");
 
-    refreshIntervalId: number = -1;
-    usingHttps = location.protocol === "https:";
+    refreshIntervalId = -1;
+    isSecureServer = accessManager.default.secureServer();
     
     spinners = {
         serverCertificate: ko.observable<boolean>()
@@ -38,7 +38,7 @@ class licenseWidget extends widget {
     }
 
     private canLoadCertificateInfo() {
-        return this.usingHttps && accessManager.default.isOperatorOrAbove();
+        return this.isSecureServer && accessManager.default.isOperatorOrAbove();
     }
 
     compositionComplete() {
@@ -62,7 +62,7 @@ class licenseWidget extends widget {
 
                 const nowPlusMonth = moment.utc().add(1, 'months');
                 
-                let expirationClass: string = "";
+                let expirationClass = "";
 
                 if (date.isBefore()) {
                     expirationClass = "text-danger";

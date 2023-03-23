@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Newtonsoft.Json;
 using Raven.Client.Documents.Operations.Replication;
@@ -29,12 +30,14 @@ namespace Raven.Client.ServerWide
         ulong GetTaskKey();
 
         string GetMentorNode();
-
+        
         string GetDefaultTaskName();
 
         string GetTaskName();
 
         bool IsResourceIntensive();
+
+        bool IsPinnedToMentorNode();
     }
 
     public interface IDatabaseTaskStatus
@@ -102,6 +105,11 @@ namespace Raven.Client.ServerWide
         }
 
         public bool IsResourceIntensive()
+        {
+            return false;
+        }
+
+        public bool IsPinnedToMentorNode()
         {
             return false;
         }
@@ -213,9 +221,27 @@ namespace Raven.Client.ServerWide
             if (Promotables.Contains(myTag)) // if we are a promotable we can't have any destinations
                 return destinations;
 
-            var nodes = Members.Concat(Rehabs);
+            if (Rehabs.Contains(myTag)) // if I'm rehab my only destination is my mentor
+            {
+                var myUrl = clusterTopology.GetUrlFromTag(myTag);
+                var repNode = WhoseTaskIsIt(state, new PromotableTask(myTag, myUrl, databaseName));
+                if (repNode == null)
+                {
+                    return destinations;
+                }
+                var repNodeUrl = clusterTopology.GetUrlFromTag(repNode);
 
-            foreach (var node in nodes)
+                destinations.Add(new InternalReplication
+                {
+                    NodeTag = repNode,
+                    Url = repNodeUrl,
+                    Database = databaseName
+                });
+
+                return destinations;
+            }
+
+            foreach (var node in Members)
             {
                 if (node == myTag) // skip me
                     continue;
@@ -231,11 +257,24 @@ namespace Raven.Client.ServerWide
 
                 var url = clusterTopology.GetUrlFromTag(promotable);
                 PredefinedMentors.TryGetValue(promotable, out var mentor);
-                if (WhoseTaskIsIt(state, new PromotableTask(promotable, url, databaseName, mentor), null) == myTag)
+                if (WhoseTaskIsIt(state, new PromotableTask(promotable, url, databaseName, mentor)) == myTag)
                 {
                     list.Add(url);
                 }
             }
+
+            foreach (var rehab in Rehabs)
+            {
+                if (deletionInProgress != null && deletionInProgress.ContainsKey(rehab))
+                    continue;
+
+                var url = clusterTopology.GetUrlFromTag(rehab);
+                if (WhoseTaskIsIt(state, new PromotableTask(rehab, url, databaseName)) == myTag)
+                {
+                    list.Add(url);
+                }
+            }
+
             // remove nodes that are not in the raft cluster topology
             list.RemoveAll(url => clusterTopology.TryGetNodeTagByUrl(url).HasUrl == false);
 
@@ -402,7 +441,7 @@ namespace Raven.Client.ServerWide
         public string WhoseTaskIsIt(
             RachisState state,
             IDatabaseTask task,
-            Func<string> getLastResponsibleNode)
+            Func<string> getLastResponsibleNode = null)
         {
             if (state == RachisState.Candidate || state == RachisState.Passive)
                 return null;
@@ -411,6 +450,9 @@ namespace Raven.Client.ServerWide
             if (mentorNode != null)
             {
                 if (Members.Contains(mentorNode))
+                    return mentorNode;
+                
+                if (AllNodes.Contains(mentorNode) && task.IsPinnedToMentorNode())
                     return mentorNode;
             }
 

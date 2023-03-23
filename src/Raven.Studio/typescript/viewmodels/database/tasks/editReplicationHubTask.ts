@@ -25,11 +25,13 @@ import deleteReplicationHubAccessConfigCommand = require("commands/database/task
 import genUtils = require("common/generalUtils");
 import certificateUtils = require("common/certificateUtils");
 import viewHelpers = require("common/helpers/view/viewHelpers");
-import tasksCommonContent = require("models/database/tasks/tasksCommonContent");
+import accessManager = require("common/shell/accessManager");
 
 class editReplicationHubTask extends viewModelBase {
 
     view = require("views/database/tasks/editReplicationHubTask.html");
+    pinResponsibleNodeButtonsScriptView = require("views/partial/pinResponsibleNodeButtonsScript.html");
+    pinResponsibleNodeTextScriptView = require("views/partial/pinResponsibleNodeTextScript.html");
     
     editedHubTask = ko.observable<ongoingTaskReplicationHubEditModel>();
     editedReplicationAccessItem = ko.observable<replicationAccessHubModel>(null);
@@ -37,7 +39,7 @@ class editReplicationHubTask extends viewModelBase {
     private taskId: number = null;
     isNewTask = ko.observable<boolean>(true);
     
-    canDefineCertificates = location.protocol === "https:";
+    canDefineCertificates = accessManager.default.secureServer();
     
     possibleMentors = ko.observableArray<string>([]);
 
@@ -145,11 +147,6 @@ class editReplicationHubTask extends viewModelBase {
                         "</li>" +
                     "</ul>"
             });
-
-        popoverUtils.longWithHover($(".responsible-node"),
-            {
-                content: tasksCommonContent.responsibleNodeInfo
-            });
     }
     
     private loadPossibleMentors() {
@@ -173,7 +170,7 @@ class editReplicationHubTask extends viewModelBase {
         });
         
         this.visibleReplicationAccessItems = ko.pureComputed(() => {
-            let items = this.filteredReplicationAccessItems();
+            const items = this.filteredReplicationAccessItems();
             
             const numberOfItemsToShow = this.batchCounter() * this.accessItemsBatch;
             return items.slice(0, numberOfItemsToShow);
@@ -195,6 +192,7 @@ class editReplicationHubTask extends viewModelBase {
             model.disabled,
             model.manualChooseMentor,
             model.mentorNode,
+            model.pinMentorNode,
             model.delayReplicationTime,
             model.showDelayReplication,
             model.preventDeletions,
@@ -331,7 +329,7 @@ class editReplicationHubTask extends viewModelBase {
 
     cloneItem() {
         const editedItem = this.editedReplicationAccessItem();
-        let cloneItem = new replicationAccessHubModel("", null, editedItem.hubToSinkPrefixes(), editedItem.sinkToHubPrefixes(), editedItem.filteringPathsRequired());
+        const cloneItem = new replicationAccessHubModel("", null, editedItem.hubToSinkPrefixes(), editedItem.sinkToHubPrefixes(), editedItem.filteringPathsRequired());
         this.editedReplicationAccessItem(cloneItem);
         this.initTooltips();
     }
@@ -503,12 +501,12 @@ class editReplicationHubTask extends viewModelBase {
         this.editedReplicationAccessItem().accessConfigurationWasExported(true);
     }
     
-    exportConfiguration(includeAccessInfo: boolean = false) {
+    exportConfiguration(includeAccessInfo = false) {
         const hubTaskItem = this.editedHubTask();
         const databaseName = this.activeDatabase().name;
         const topologyUrls = clusterTopologyManager.default.topology().nodes().map(x => x.serverUrl());
 
-        let configurationToExport = {
+        const configurationToExport = {
             Database: databaseName,
             HubName: hubTaskItem.taskName(),
             TopologyUrls: topologyUrls,

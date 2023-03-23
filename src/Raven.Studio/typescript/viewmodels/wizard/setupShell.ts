@@ -11,7 +11,6 @@ import autoCompleteBindingHandler = require("common/bindingHelpers/autoCompleteB
 import requestExecution = require("common/notifications/requestExecution");
 import protractedCommandsDetector = require("common/notifications/protractedCommandsDetector");
 import buildInfo = require("models/resources/buildInfo");
-import constants = require("common/constants/constants");
 import chooseTheme = require("viewmodels/shell/chooseTheme");
 import app = require("durandal/app");
 import serverSetup from "models/wizard/serverSetup";
@@ -39,7 +38,7 @@ class setupShell extends viewModelBase {
     }
 
     // Override canActivate: we can always load this page, regardless of any system db prompt.
-    canActivate(args: any): any {
+    canActivate(): any {
         return true;
     }
 
@@ -59,12 +58,7 @@ class setupShell extends viewModelBase {
         new getServerBuildVersionCommand()
             .execute()
             .done((serverBuildResult: serverBuildVersionDto) => {
-                buildInfo.serverBuildVersion(serverBuildResult);
-
-                const currentBuildVersion = serverBuildResult.BuildVersion;
-                if (currentBuildVersion !== constants.DEV_BUILD_NUMBER) {
-                    buildInfo.serverMainVersion(Math.floor(currentBuildVersion / 10000));
-                }
+                buildInfo.onServerBuildVersion(serverBuildResult);
             });
     }
 
@@ -81,7 +75,7 @@ class setupShell extends viewModelBase {
         router.map(setupRoutes.get()).buildNavigationModel();
 
         router.mapUnknownRoutes((instruction: DurandalRouteInstruction) => {
-            const queryString = !!instruction.queryString ? ("?" + instruction.queryString) : "";
+            const queryString = instruction.queryString ? ("?" + instruction.queryString) : "";
 
             messagePublisher.reportError("Unknown route", "The route " + instruction.fragment + queryString + " doesn't exist, redirecting...");
 

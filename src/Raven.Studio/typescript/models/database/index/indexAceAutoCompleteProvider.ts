@@ -66,8 +66,8 @@ class indexAceAutoCompleteProvider {
                 this.getIndexMapCollectionFieldsForAutocomplete(session, completedToken)
                     .done(x => returnedDeferred.resolve(x))
                     .fail(() => returnedDeferred.reject());
-            } else if (currentToken.type === "data.prefix" || currentToken.type === "data.suffix") {
-                completedToken = currentToken.type === "data.prefix" ? currentToken : prevToken;
+            } else if (currentToken.type === "punctuation.operator") {
+                completedToken = prevToken;
 
                 const firstToken = session.getTokenAt(0, 0);
                 // treat a "from [foo] in [bar] type of index syntax
@@ -96,7 +96,7 @@ class indexAceAutoCompleteProvider {
         // find the matching alias and get list of fields
         if (collectionAliases.length > 0) {
             const matchingAliasKeyValue = collectionAliases.find(x => x.aliasKey.replace('.', '').trim() === currentToken.value.replace('.', '').trim());
-            if (!!matchingAliasKeyValue) {
+            if (matchingAliasKeyValue) {
                 // get list of fields according to it's collection's first row
                 if (matchingAliasKeyValue.aliasValuePrefix.toLowerCase() === "docs") {
                     new collection(matchingAliasKeyValue.aliasValueSuffix, this.activeDatabase)
@@ -136,7 +136,7 @@ class indexAceAutoCompleteProvider {
                 const currentToken = curRowTokens[curTokenInRow];
                 if (currentToken.type == "from.alias") {
                     curAliasKey = curRowTokens[curTokenInRow].value.trim();
-                } else if (!!curAliasKey) {
+                } else if (curAliasKey) {
                     if (curRowTokens[curTokenInRow].type == "docs" || currentToken.type == "collections") {
                         curAliasValuePrefix = currentToken.value;
                     } else if (curRowTokens[curTokenInRow].type == "collectionName") {

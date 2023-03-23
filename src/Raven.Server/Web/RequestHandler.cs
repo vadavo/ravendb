@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features.Authentication;
 using Microsoft.AspNetCore.WebUtilities;
 using Raven.Client;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Cluster;
 using Raven.Client.Extensions;
@@ -96,6 +97,11 @@ namespace Raven.Server.Web
                 return _requestBodyStream;
             _requestBodyStream = new StreamWithTimeout(GetDecompressedStream(HttpContext.Request.Body, HttpContext.Request.Headers));
 
+            if (TrafficWatchManager.HasRegisteredClients)
+            {
+                HttpContext.Items["RequestStream"] = _requestBodyStream;
+            }
+
             _context.HttpContext.Response.RegisterForDispose(_requestBodyStream);
 
             return _requestBodyStream;
@@ -154,11 +160,29 @@ namespace Raven.Server.Web
             return false;
         }
 
+        public static void ValidateNodeForAddingToDb(string databaseName, string node, DatabaseRecord databaseRecord, ClusterTopology clusterTopology, string baseMessage = null)
+        {
+            baseMessage ??= "Can't execute the operation";
+
+            var databaseIsBeenDeleted = databaseRecord.DeletionInProgress != null &&
+                                        databaseRecord.DeletionInProgress.TryGetValue(node, out var deletionInProgress) &&
+                                        deletionInProgress != DeletionInProgressStatus.No;
+            if (databaseIsBeenDeleted)
+                throw new InvalidOperationException($"{baseMessage}, because the database {databaseName} is currently being deleted from node {node} (which is in the new topology)");
+
+            var url = clusterTopology.GetUrlFromTag(node);
+            if (url == null)
+                throw new InvalidOperationException($"{baseMessage}, because node {node} (which is in the new topology) is not part of the cluster");
+
+            if (databaseRecord.Encrypted && url.StartsWith("https:", StringComparison.OrdinalIgnoreCase) == false)
+                throw new InvalidOperationException($"{baseMessage}, because database {databaseName} is encrypted but node {node} (which is in the new topology) doesn't have an SSL certificate.");
+        }
+
         protected async Task WaitForExecutionOnSpecificNode(TransactionOperationContext context, ClusterTopology clusterTopology, string node, long index)
         {
             await ServerStore.Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
 
-            using (var requester = ClusterRequestExecutor.CreateForSingleNode(clusterTopology.GetUrlFromTag(node), ServerStore.Server.Certificate.Certificate))
+            using (var requester = ClusterRequestExecutor.CreateForSingleNode(clusterTopology.GetUrlFromTag(node), ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 await requester.ExecuteAsync(new WaitForRaftIndexCommand(index), context);
             }
@@ -184,7 +208,7 @@ namespace Raven.Server.Web
                     foreach (var member in members)
                     {
                         var url = clusterTopology.GetUrlFromTag(member);
-                        var executor = ClusterRequestExecutor.CreateForSingleNode(url, ServerStore.Server.Certificate.Certificate);
+                        var executor = ClusterRequestExecutor.CreateForSingleNode(url, ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer);
                         executors.Add(executor);
                         waitingTasks.Add(ExecuteTask(executor, member, cts.Token));
                     }
@@ -483,7 +507,7 @@ namespace Raven.Server.Web
 
             dataAsString = Uri.UnescapeDataString(dataAsString);
 
-            if (DateTime.TryParseExact(dataAsString, DefaultFormat.DateTimeOffsetFormatsToWrite, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime result))
+            if (DateTime.TryParseExact(dataAsString, DefaultFormat.DateTimeFormatsToRead, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime result))
                 return result;
 
             ThrowInvalidDateTime(name, dataAsString);

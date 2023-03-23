@@ -24,8 +24,11 @@ import smugglerDatabaseDetails = require("viewmodels/common/notificationCenter/d
 import sqlMigrationDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/sqlMigrationDetails");
 import patchDocumentsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/patchDocumentsDetails");
 import virtualBulkInsertDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualBulkInsertDetails");
+import virtualBulkInsertFailuresDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualBulkInsertFailuresDetails");
 import virtualUpdateByQueryDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualUpdateByQueryDetails");
+import virtualUpdateByQueryFailuresDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualUpdateByQueryFailuresDetails");
 import virtualDeleteByQueryDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualDeleteByQueryDetails");
+import virtualDeleteByQueryFailuresDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualDeleteByQueryFailuresDetails");
 import bulkInsertDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/bulkInsertDetails");
 import revertRevisionsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/revertRevisionsDetails");
 import enforceRevisionsConfigurationDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/enforceRevisionsConfigurationDetails");
@@ -50,6 +53,7 @@ import transactionCommandsDetails = require("viewmodels/common/notificationCente
 import dumpRawIndexDataDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/dumpRawIndexDataDetails");
 
 import studioSettings = require("common/settings/studioSettings");
+import optimizeIndexDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/optimizeIndexDetails");
 
 interface detailsProvider {
     supportsDetailsFor(notification: abstractNotification): boolean;
@@ -62,7 +66,7 @@ interface customOperationMerger {
 
 interface customOperationHandler {
     tryHandle(operationDto: Raven.Server.NotificationCenter.Notifications.OperationChanged, notificationsContainer: KnockoutObservableArray<abstractNotification>,
-              database: database, callbacks: { spinnersCleanup: Function, onChange: Function }): boolean;
+              database: database, callbacks: { spinnersCleanup: () => void, onChange: () => void }): boolean;
 }
 
 class notificationCenter {
@@ -78,6 +82,10 @@ class notificationCenter {
 
     showNotifications = ko.observable<boolean>(false);
     pinNotifications = ko.observable<boolean>(false);
+    
+    isShowingAllNotifications = ko.observable<boolean>(false);
+    static readonly numberOfNotificationsToShow = 300;
+    
     includeInDom = ko.observable<boolean>(false); // to avoid RavenDB-10660
 
     globalNotifications = ko.observableArray<abstractNotification>();
@@ -87,7 +95,10 @@ class notificationCenter {
     databaseOperationsWatch = new notificationCenterOperationsWatch();
 
     allNotifications: KnockoutComputed<abstractNotification[]>;
+    notificationsToShow: KnockoutComputed<abstractNotification[]>;
+    
     visibleNotifications: KnockoutComputed<abstractNotification[]>;
+    visibleNotificationsTrimmed: KnockoutComputed<abstractNotification[]>;
 
     totalItemsCount: KnockoutComputed<number>;
     successItemsCount: KnockoutComputed<number>;
@@ -139,11 +150,15 @@ class notificationCenter {
             replayTransactionCommandsDetails,
             transactionCommandsDetails,
             dumpRawIndexDataDetails,
+            optimizeIndexDetails,
             
             // virtual operations:
             virtualBulkInsertDetails,
+            virtualBulkInsertFailuresDetails,
             virtualUpdateByQueryDetails,
+            virtualUpdateByQueryFailuresDetails,
             virtualDeleteByQueryDetails,
+            virtualDeleteByQueryFailuresDetails,
 
             // performance hints:
             indexingDetails,
@@ -189,6 +204,12 @@ class notificationCenter {
             return allNotifications.filter(x => x.severity() === severity);
         });
 
+        this.visibleNotificationsTrimmed = ko.pureComputed(() =>
+            this.visibleNotifications().slice(0, notificationCenter.numberOfNotificationsToShow));
+
+        this.notificationsToShow = ko.pureComputed(() =>
+            this.isShowingAllNotifications() ? this.visibleNotifications() : this.visibleNotificationsTrimmed());
+
         this.totalItemsCount = ko.pureComputed(() => this.allNotifications().length);
 
         const bySeverityCounter = (severity: Raven.Server.NotificationCenter.Notifications.NotificationSeverity) => {
@@ -214,7 +235,7 @@ class notificationCenter {
     }
 
     initialize() {
-        $("#notification-center").on('transitionend', e => {
+        $("#notification-center").on('transitionend', () => {
             if (!this.showNotifications()) {
                 this.includeInDom(false);
             }
@@ -223,6 +244,7 @@ class notificationCenter {
         this.showNotifications.subscribe((show: boolean) => {
             if (show) {
                 this.includeInDom(true);
+                this.isShowingAllNotifications(false);
                 window.addEventListener("click", this.hideHandler, true);
             } else {
                 window.removeEventListener("click", this.hideHandler, true);
@@ -248,7 +270,7 @@ class notificationCenter {
         serverWideClient.watchAllAlerts(e => this.onAlertReceived(e, this.globalNotifications, null));
         serverWideClient.watchAllPerformanceHints(e => this.onPerformanceHintReceived(e, this.globalNotifications, null));
         serverWideClient.watchAllOperations(e => this.onOperationChangeReceived(e, this.globalNotifications, null));
-        serverWideClient.watchAllNotificationUpdated(e => this.onNotificationUpdated(e, this.globalNotifications, null));
+        serverWideClient.watchAllNotificationUpdated(e => this.onNotificationUpdated(e, this.globalNotifications));
     }
 
     configureForDatabase(client: databaseNotificationCenterClient): changeSubscription[] {
@@ -259,7 +281,7 @@ class notificationCenter {
             client.watchAllAlerts(e => this.onAlertReceived(e, this.databaseNotifications, db)),
             client.watchAllPerformanceHints(e => this.onPerformanceHintReceived(e, this.databaseNotifications, db)),
             client.watchAllOperations(e => this.onOperationChangeReceived(e, this.databaseNotifications, db)),
-            client.watchAllNotificationUpdated(e => this.onNotificationUpdated(e, this.databaseNotifications, db)),
+            client.watchAllNotificationUpdated(e => this.onNotificationUpdated(e, this.databaseNotifications)),
             client.watchAllDatabaseStatsChanged(e => collectionsTracker.default.onDatabaseStatsChanged(e, db))
         ];
     }
@@ -361,8 +383,7 @@ class notificationCenter {
         invokeOnChange();
     }
 
-    private onNotificationUpdated(notificationUpdatedDto: Raven.Server.NotificationCenter.Notifications.NotificationUpdated, notificationsContainer: KnockoutObservableArray<abstractNotification>,
-        database: database) {
+    private onNotificationUpdated(notificationUpdatedDto: Raven.Server.NotificationCenter.Notifications.NotificationUpdated, notificationsContainer: KnockoutObservableArray<abstractNotification>) {
 
         const existingOperation = notificationsContainer().find(x => x.id === notificationUpdatedDto.NotificationId) as operation;
         if (existingOperation) {
@@ -395,6 +416,7 @@ class notificationCenter {
 
     dismissAll() {
         this.allNotifications().forEach(notification => this.dismiss(notification));
+        this.isShowingAllNotifications(false);
     }
 
     dismiss(notification: abstractNotification) {
@@ -485,7 +507,7 @@ class notificationCenter {
             }
         }
 
-        throw new Error("Unsupported notification: " + notification);
+        throw new Error("Unsupported notification: " + notification.type);
     }
 
     private shouldConsumeHideEvent(e: Event) {
@@ -498,6 +520,10 @@ class notificationCenter {
 
     filterBySeverity(severity: Raven.Server.NotificationCenter.Notifications.NotificationSeverity) {
         this.severityFilter(severity);
+    }
+
+    showAllNotifications() {
+        this.isShowingAllNotifications(true);
     }
 }
 

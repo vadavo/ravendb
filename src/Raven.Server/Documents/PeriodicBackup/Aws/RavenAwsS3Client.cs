@@ -5,7 +5,6 @@ using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web;
 using Amazon;
 using Amazon.Runtime;
 using Amazon.S3;
@@ -24,6 +23,7 @@ namespace Raven.Server.Documents.PeriodicBackup.Aws
         private readonly CancellationToken _cancellationToken;
         internal Size MaxUploadPutObject = new Size(256, SizeUnit.Megabytes);
         internal Size MinOnePartUploadSizeLimit = new Size(100, SizeUnit.Megabytes);
+        internal readonly AmazonS3Config Config;
 
         private static readonly Size TotalBlocksSizeLimit = new Size(5, SizeUnit.Terabytes);
 
@@ -50,31 +50,38 @@ namespace Raven.Server.Documents.PeriodicBackup.Aws
             if (string.IsNullOrWhiteSpace(s3Settings.BucketName))
                 throw new ArgumentException("AWS Bucket Name cannot be null or empty");
 
-            var config = new AmazonS3Config
-            {
-                Timeout = configuration.CloudStorageOperationTimeout.AsTimeSpan
-            };
+            AmazonS3Config config;
 
             if (string.IsNullOrWhiteSpace(s3Settings.CustomServerUrl))
             {
                 if (string.IsNullOrWhiteSpace(s3Settings.AwsRegionName))
                     throw new ArgumentException("AWS Region Name cannot be null or empty");
 
-                config.RegionEndpoint = RegionEndpoint.GetBySystemName(s3Settings.AwsRegionName);
+                config = new AmazonS3Config
+                {
+                    RegionEndpoint = RegionEndpoint.GetBySystemName(s3Settings.AwsRegionName)
+                };
             }
             else
             {
+                _usingCustomServerUrl = true;
+
+                config = new AmazonS3Config
+                {
+                    ForcePathStyle = s3Settings.ForcePathStyle,
+                    ServiceURL = s3Settings.CustomServerUrl
+                };
+
                 if (string.IsNullOrWhiteSpace(s3Settings.AwsRegionName) == false)
                 {
                     // region for custom server url isn't mandatory
-                    config.RegionEndpoint = RegionEndpoint.GetBySystemName(s3Settings.AwsRegionName);
+                    // it's needed if the region cannot be determined from the service endpoint
+                    config.AuthenticationRegion = s3Settings.AwsRegionName;
                 }
-
-                _usingCustomServerUrl = true;
-                config.UseHttp = true;
-                config.ForcePathStyle = s3Settings.ForcePathStyle;
-                config.ServiceURL = s3Settings.CustomServerUrl;
             }
+
+            config.Timeout = configuration.CloudStorageOperationTimeout.AsTimeSpan;
+            Config = config;
 
             AWSCredentials credentials;
             if (string.IsNullOrWhiteSpace(s3Settings.AwsSessionToken))

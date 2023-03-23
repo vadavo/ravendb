@@ -44,20 +44,20 @@ abstract class abstractDatabaseAndNodeAwareTableWidget<TRaw, TStats extends stat
 
         grid.headerVisible(true);
 
-        this.gridController().customRowClassProvider(item => item.even ? ["even"] : []);
+        grid.customRowClassProvider(item => item.even ? ["even"] : []);
         
-        grid.init((s, t) => this.prepareGridData(), (containerWidth, results) => this.prepareColumns(containerWidth, results));
+        grid.init(() => this.prepareGridData(), (containerWidth, results) => this.prepareColumns(containerWidth, results));
 
         this.enableSyncUpdates();
 
-        for (let ws of this.controller.getConnectedLiveClients()) {
+        for (const ws of this.controller.getConnectedLiveClients()) {
             this.onClientConnected(ws);
         }
     }
     
     protected abstract prepareColumns(containerWidth:number, results: pagedResult<TTableItem>): virtualColumn[];
 
-    protected afterSyncUpdate(updatesCount: number) {
+    protected afterSyncUpdate() {
         this.gridController().reset(false);
     }
 

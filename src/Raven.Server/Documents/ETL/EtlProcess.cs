@@ -422,7 +422,7 @@ namespace Raven.Server.Documents.ETL
                 }
                 catch (Exception e)
                 {
-                    if (CancellationToken.IsCancellationRequested == false)
+                    if (CancellationToken.IsCancellationRequested == false) 
                     {
                         string msg = $"Failed to load transformed data for '{Name}'";
 
@@ -536,7 +536,7 @@ namespace Raven.Server.Documents.ETL
             {
                 if (MemoryUsageGuard.TryIncreasingMemoryUsageForThread(_threadAllocations, ref _currentMaximumAllowedMemory,
                         totalAllocated,
-                        Database.DocumentsStorage.Environment.Options.RunningOn32Bits, Logger, out var memoryUsage) == false)
+                        Database.DocumentsStorage.Environment.Options.RunningOn32Bits, Database.ServerStore.Server.MetricCacher, Logger, out var memoryUsage) == false)
                 {
                     var reason = $"Stopping the batch because cannot budget additional memory. Current budget: {totalAllocated}.";
                     if (memoryUsage != null)
@@ -622,7 +622,7 @@ namespace Raven.Server.Documents.ETL
                 {
                     // This has lower priority than request processing, so we let the OS
                     // schedule this appropriately
-                    Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                    ThreadHelper.TrySetThreadPriority(ThreadPriority.BelowNormal, threadName, Logger);
                     NativeMemory.EnsureRegistered();
                     Run();
                 }

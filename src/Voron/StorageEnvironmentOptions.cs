@@ -85,6 +85,14 @@ namespace Voron
 
         public bool EnablePrefetching = true;
 
+        internal DisposableAction DisableOnRecoveryErrorHandler()
+        {
+            var handler = OnRecoveryError;
+            OnRecoveryError = null;
+
+            return new DisposableAction(() => OnRecoveryError = handler);
+        }
+
         public void InvokeRecoveryError(object sender, string message, Exception e)
         {
             var handler = OnRecoveryError;
@@ -95,6 +103,14 @@ namespace Voron
             }
 
             handler(this, new RecoveryErrorEventArgs(message, e));
+        }
+
+        internal DisposableAction DisableOnIntegrityErrorOfAlreadySyncedDataHandler()
+        {
+            var handler = OnIntegrityErrorOfAlreadySyncedData;
+            OnIntegrityErrorOfAlreadySyncedData = null;
+
+            return new DisposableAction(() => OnIntegrityErrorOfAlreadySyncedData = handler);
         }
 
         public void InvokeIntegrityErrorOfAlreadySyncedData(object sender, string message, Exception e)
@@ -432,9 +448,9 @@ namespace Voron
                     var drivesInfo = PlatformDetails.RunningOnPosix ? DriveInfo.GetDrives() : null;
                     return new DriveInfoByPath
                     {
-                        BasePath = DiskSpaceChecker.GetDriveInfo(BasePath.FullPath, drivesInfo, out _),
-                        JournalPath = DiskSpaceChecker.GetDriveInfo(JournalPath.FullPath, drivesInfo, out _),
-                        TempPath = DiskSpaceChecker.GetDriveInfo(TempPath.FullPath, drivesInfo, out _)
+                        BasePath = DiskUtils.GetDriveInfo(BasePath.FullPath, drivesInfo, out _),
+                        JournalPath = DiskUtils.GetDriveInfo(JournalPath.FullPath, drivesInfo, out _),
+                        TempPath = DiskUtils.GetDriveInfo(TempPath.FullPath, drivesInfo, out _)
                     };
                 });
             }
@@ -582,6 +598,11 @@ namespace Voron
                 {
                     return reusedCount >= reusedLimit;
                 }
+            }
+
+            public override int GetNumberOfJournalsForReuse()
+            {
+                return _journalsForReuse.Count;
             }
 
             private void AttemptToReuseJournal(VoronPathSetting desiredPath, long desiredSize)
@@ -982,6 +1003,11 @@ namespace Voron
             {
             }
 
+            public override int GetNumberOfJournalsForReuse()
+            {
+                return 0;
+            }
+
             protected override void Disposing()
             {
                 if (Disposed)
@@ -1238,6 +1264,8 @@ namespace Voron
 
         public abstract void TryStoreJournalForReuse(VoronPathSetting filename);
 
+        public abstract int GetNumberOfJournalsForReuse();
+
         private void TryDelete(string file)
         {
             try
@@ -1402,6 +1430,21 @@ namespace Voron
                     }
                 }
             }
+        }
+
+        internal TestingStuff ForTestingPurposes;
+
+        internal TestingStuff ForTestingPurposesOnly()
+        {
+            if (ForTestingPurposes != null)
+                return ForTestingPurposes;
+
+            return ForTestingPurposes = new TestingStuff();
+        }
+
+        internal class TestingStuff
+        {
+            public int? WriteToJournalCompressionAcceleration = null;
         }
     }
 }

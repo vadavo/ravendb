@@ -78,6 +78,8 @@ interface IndexErrorPerDocument {
     Action: string;
     IndexName: string;
     Timestamp: string;
+    LocalTime: string;
+    RelativeTime: string;
 }
 
 interface revisionTimeSeriesDto {
@@ -514,7 +516,7 @@ interface queryCompleterProviders {
 type rqlQueryType = "Select" | "Update";
 
 type autoCompleteCompleter = (editor: AceAjax.Editor, session: AceAjax.IEditSession, pos: AceAjax.Position, prefix: string, callback: (errors: any[], wordlist: autoCompleteWordList[]) => void) => void;
-type certificateMode = "generate" | "upload" | "editExisting" | "replace";
+type certificateMode = "generate" | "regenerate" | "upload" | "editExisting" | "replace";
 
 type dbCreationMode = "newDatabase" | "restore" | "legacyMigration";
 
@@ -573,7 +575,14 @@ interface sqlMigrationAdvancedSettingsDto {
     DetectManyToMany: boolean 
 }
 
-type virtualNotificationType = "CumulativeBulkInsert" | "AttachmentUpload" | "CumulativeUpdateByQuery" | "CumulativeDeleteByQuery";
+type virtualNotificationType = 
+    "CumulativeBulkInsert" 
+    | "CumulativeBulkInsertFailures" 
+    | "AttachmentUpload" 
+    | "CumulativeUpdateByQuery" 
+    | "CumulativeUpdateByQueryFailures" 
+    | "CumulativeDeleteByQuery"
+    | "CumulativeDeleteByQueryFailures";
 
 declare module Raven.Server.NotificationCenter.Notifications {
     interface Notification {
@@ -597,9 +606,23 @@ interface virtualBulkOperationItem {
     timeSeriesProcessed: number;
 }
 
+interface virtualBulkOperationFailureItem {
+    id: string;
+    date: string;
+    duration: number;
+    errorMsg: string;
+    error: string;
+}
+
 interface queryBasedVirtualBulkOperationItem extends virtualBulkOperationItem {
     query: string;
     indexOrCollectionUsed: string;
+}
+
+interface queryBasedVirtualBulkOperationFailureItem extends virtualBulkOperationItem {
+    query: string;
+    errorMsg: string;
+    error: string;
 }
 
 type adminLogsHeaderType = "Source" | "Logger";
@@ -656,6 +679,7 @@ interface textColumnOpts<T> {
     extraClass?: (item: T) => string;
     useRawValue?: (item: T) => boolean;
     title?: (item:T) => string;
+    headerTitle?: string;
     sortable?: "number" | "string" | valueProvider<T>;
     defaultSortOrder?: sortMode;
     customComparator?: (a: any, b: any) => number;
@@ -675,7 +699,7 @@ interface timeSeriesColumnOpts<T> extends textColumnOpts<T> {
 }
 
 interface virtualColumnDto {
-    type: "flags" | "checkbox" | "text" | "hyperlink" | "custom" | "timeSeries" | "nodeTag" | "iconsPlusText";
+    type: "flags" | "checkbox" | "text" | "hyperlink" | "custom" | "timeSeries" | "nodeTag" | "multiNodeTags" | "iconsPlusText";
     width: string;
     header: string;
     serializedValue: string;
@@ -861,6 +885,11 @@ interface cachedDateValue<T> {
 
 type widgetType = Raven.Server.Dashboard.Cluster.ClusterDashboardNotificationType | "Welcome" | "License";
 
+interface ioStatsWidgetConfig {
+    splitIops?: boolean;
+    splitThroughput?: boolean;
+}
+
 type databaseAccessLevel = `Database${Raven.Client.ServerWide.Operations.Certificates.DatabaseAccess}`;
 type securityClearance = Raven.Client.ServerWide.Operations.Certificates.SecurityClearance;
 type accessLevel = databaseAccessLevel | securityClearance;
@@ -868,11 +897,32 @@ type accessLevel = databaseAccessLevel | securityClearance;
 interface iconPlusText {
     iconClass: string;
     text: string;
-    textClass: string;
-    title: string;
+    textClass?: string;
+    title?: string;
 }
 
 interface columnPreviewFeature {
     install($tooltip: JQuery, valueProvider: () => any, elementProvider: () => any, containerSelector: string): void;
     syntax(column: virtualColumn, escapedValue: any, element: any): void;
 }
+
+interface rawTaskItem {
+    type: Raven.Client.Documents.Operations.OngoingTasks.OngoingTaskType;
+    dbName: string;
+    count: number;
+    node: string;
+}
+
+interface databaseDisconnectedEventArgs {
+    database: database;
+    cause: databaseDisconnectionCause;
+}
+
+interface taskInfo {
+    nameForUI: string;
+    icon: string;
+    colorClass: string;
+}
+
+type TombstoneItem = Raven.Server.Documents.TombstoneCleaner.StateHolder & { Collection: string };
+type TombstonesStateOnWire = Omit<Raven.Server.Documents.TombstoneCleaner.TombstonesState, "Tombstones"> & { Results: TombstoneItem[] };

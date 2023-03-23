@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
+using Raven.Server.Documents.Indexes.Static;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow.Json;
@@ -167,10 +168,16 @@ namespace Raven.Server.Documents.Indexes.Workers
                         var keepRunning = true;
                         var earlyExit = false;
                         var lastCollectionEtag = -1L;
+
                         while (keepRunning)
                         {
+                            UpdateReferences(indexContext, collection);
+
                             var hasChanges = false;
+                            earlyExit = false;
+
                             var indexed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                             using (queryContext.OpenReadTransaction())
                             {
                                 sw.Restart();
@@ -230,7 +237,15 @@ namespace Raven.Server.Documents.Indexes.Workers
 
                                                 if (CanContinueReferenceBatch() == false)
                                                 {
-                                                    _referencesState.Set(actionType, collection, referencedItem, current.LowerSourceDocumentId ?? current.Id, lastIndexedParentEtag, indexContext);
+                                                    // updating the last reference state in order to continue from the place we left off
+                                                    referenceState = new ReferencesState.ReferenceState(referencedItem.Key, referencedItem.Etag, current.LowerSourceDocumentId ?? current.Id, lastIndexedParentEtag);
+
+                                                    if (batchContinuationResult != Index.CanContinueBatchResult.RenewTransaction)
+                                                    {
+                                                        // we save where we last stopped in order to continue running in a NEW indexing batch
+                                                        _referencesState.Set(actionType, collection, referenceState, indexContext);
+                                                    }
+
                                                     earlyExit = true;
                                                     break;
                                                 }
@@ -283,6 +298,8 @@ namespace Raven.Server.Documents.Indexes.Workers
 
                                 if (hasChanges == false)
                                     break;
+
+                                _index._forTestingPurposes?.BeforeClosingDocumentsReadTransactionForHandleReferences?.Invoke();
                             }
 
                             bool CanContinueReferenceBatch()
@@ -343,6 +360,29 @@ namespace Raven.Server.Documents.Indexes.Workers
                 _referencesState.Clear(actionType);
 
             return (moreWorkFound, batchContinuationResult);
+        }
+
+        private void UpdateReferences(TransactionOperationContext indexContext, string collection)
+        {
+            // References were found during handling references
+            // (HandleReferences is the first worker that is running so those references were found here).
+            // When we have a LoadDocument we save the referenced document in-memory (ReferencesByCollection) and at the end of the batch we store it in the storage
+            // BUT we process the references from the storage only
+            // In order to avoid skipping handling the found references, we must save them in the storage
+
+            if (CurrentIndexingScope.Current.ReferencesByCollection != null &&
+                CurrentIndexingScope.Current.ReferencesByCollection.TryGetValue(collection, out var values))
+            {
+                _indexStorage.ReferencesForDocuments.WriteReferencesForSingleCollection(collection, values, indexContext.Transaction);
+                values.Clear();
+            }
+
+            if (CurrentIndexingScope.Current.ReferencesByCollectionForCompareExchange != null &&
+                CurrentIndexingScope.Current.ReferencesByCollectionForCompareExchange.TryGetValue(collection, out values))
+            {
+                _indexStorage.ReferencesForCompareExchange.WriteReferencesForSingleCollection(collection, values, indexContext.Transaction);
+                values.Clear();
+            }
         }
 
         private IEnumerable<IndexItem> GetItemsFromCollectionThatReference(QueryOperationContext queryContext, TransactionOperationContext indexContext,

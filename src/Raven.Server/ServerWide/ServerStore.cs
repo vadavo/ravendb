@@ -16,6 +16,7 @@ using Lucene.Net.Search;
 using Microsoft.Extensions.Caching.Memory;
 using NCrontab.Advanced;
 using NCrontab.Advanced.Extensions;
+using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Operations.Backups;
@@ -32,6 +33,7 @@ using Raven.Client.Json;
 using Raven.Client.Json.Serialization;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Commands;
+using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Configuration;
 using Raven.Client.ServerWide.Operations.Integrations.PostgreSQL;
 using Raven.Client.ServerWide.Operations.OngoingTasks;
@@ -87,6 +89,7 @@ using Voron.Exceptions;
 using Constants = Raven.Client.Constants;
 using MemoryCache = Raven.Server.Utils.Imports.Memory.MemoryCache;
 using MemoryCacheOptions = Raven.Server.Utils.Imports.Memory.MemoryCacheOptions;
+using NodeInfo = Raven.Client.ServerWide.Commands.NodeInfo;
 
 namespace Raven.Server.ServerWide
 {
@@ -124,6 +127,7 @@ namespace Raven.Server.ServerWide
         public readonly DatabasesLandlord DatabasesLandlord;
         public readonly NotificationCenter.NotificationCenter NotificationCenter;
         public readonly ServerDashboardNotifications ServerDashboardNotifications;
+        public readonly ThreadsInfoNotifications ThreadsInfoNotifications;
         public readonly LicenseManager LicenseManager;
         public readonly FeedbackSender FeedbackSender;
         public readonly StorageSpaceMonitor StorageSpaceMonitor;
@@ -168,6 +172,8 @@ namespace Raven.Server.ServerWide
             NotificationCenter = new NotificationCenter.NotificationCenter(_notificationsStorage, null, ServerShutdown, configuration);
 
             ServerDashboardNotifications = new ServerDashboardNotifications(this, ServerShutdown);
+
+            ThreadsInfoNotifications = new ThreadsInfoNotifications(ServerShutdown);
 
             _operationsStorage = new OperationsStorage();
 
@@ -286,6 +292,11 @@ namespace Raven.Server.ServerWide
             if (_engine.LeaderTag != NodeTag)
                 throw new NotLeadingException($"Stats can be requested only from the raft leader {_engine.LeaderTag}");
             return ClusterMaintenanceSupervisor?.GetStats();
+        }
+        
+        internal LicenseType GetLicenseType()
+        {
+            return LicenseManager.LicenseStatus.Type;
         }
 
         public void UpdateTopologyChangeNotification()
@@ -622,9 +633,14 @@ namespace Raven.Server.ServerWide
 
             options.OnNonDurableFileSystemError += (obj, e) =>
             {
+                var title = "Non Durable File System - System Storage";
+
+                if (Logger.IsOperationsEnabled)
+                    Logger.Operations($"{title}. {e.Message}", e.Exception);
+
                 var alert = AlertRaised.Create(
                     null,
-                    "Non Durable File System - System Storage",
+                    title,
                     e.Message,
                     AlertType.NonDurableFileSystem,
                     NotificationSeverity.Warning,
@@ -642,13 +658,18 @@ namespace Raven.Server.ServerWide
 
             options.OnRecoveryError += (obj, e) =>
             {
+                string title = "Recovery Error - System Storage";
+
+                if (Logger.IsOperationsEnabled)
+                    Logger.Operations($"{title}. {e.Message}", e.Exception);
+
                 var alert = AlertRaised.Create(
                     null,
-                    "Recovery Error - System Storage",
+                    title,
                     e.Message,
                     AlertType.RecoveryError,
                     NotificationSeverity.Error,
-                    "Recovery Error System");
+                    key: $"Recovery Error System/{SystemTime.UtcNow.Ticks % 5}"); // if this was called multiple times let's try to not overwrite previous alerts
 
                 if (NotificationCenter.IsInitialized)
                 {
@@ -662,13 +683,18 @@ namespace Raven.Server.ServerWide
 
             options.OnIntegrityErrorOfAlreadySyncedData += (obj, e) =>
             {
+                string title = "Integrity error of already synced data - System Storage";
+
+                if (Logger.IsOperationsEnabled)
+                    Logger.Operations($"{title}. {e.Message}", e.Exception);
+
                 var alert = AlertRaised.Create(
                     null,
-                    "Integrity error of already synced data - System Storage",
+                    title,
                     e.Message,
                     AlertType.IntegrityErrorOfAlreadySyncedData,
                     NotificationSeverity.Warning,
-                    "Integrity Error of Synced Data - System");
+                    key: $"Integrity Error of Synced Data - System/{SystemTime.UtcNow.Ticks % 5}"); // if this was called multiple times let's try to not overwrite previous alerts
 
                 if (NotificationCenter.IsInitialized)
                 {
@@ -933,11 +959,12 @@ namespace Raven.Server.ServerWide
             _clusterMaintenanceSetupTask = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x =>
                 ClusterMaintenanceSetupTask(), null, "Cluster Maintenance Setup Task");
 
+            const string threadName = "Update Topology Change Notification Task";
             _updateTopologyChangeNotification = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x =>
             {
-                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                ThreadHelper.TrySetThreadPriority(ThreadPriority.BelowNormal, threadName, Logger);
                 UpdateTopologyChangeNotification();
-            }, null, "Update Topology Change Notification Task");
+            }, null, threadName);
         }
 
         private void OnStateChanged(object sender, RachisConsensus.StateTransition state)
@@ -1337,7 +1364,7 @@ namespace Raven.Server.ServerWide
                     if (cert.TryGet(nameof(CertificateReplacement.Certificate), out string base64Cert) == false)
                         throw new InvalidOperationException($"Invalid 'server/cert' value, expected to get '{nameof(CertificateReplacement.Certificate)}' property");
 
-                    var certificate = new X509Certificate2(Convert.FromBase64String(base64Cert), (string)null, X509KeyStorageFlags.MachineKeySet);
+                    var certificate = CertificateLoaderUtil.CreateCertificate(Convert.FromBase64String(base64Cert));
 
                     var now = Server.Time.GetUtcNow();
                     if (certificate.NotBefore.ToUniversalTime() > now)
@@ -1436,7 +1463,7 @@ namespace Raven.Server.ServerWide
                     // Save the received certificate
 
                     var bytesToSave = Convert.FromBase64String(certBase64);
-                    var newClusterCertificate = new X509Certificate2(bytesToSave, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+                    var newClusterCertificate = CertificateLoaderUtil.CreateCertificate(bytesToSave, flags: CertificateLoaderUtil.FlagsForExport);
 
                     if (string.IsNullOrEmpty(Configuration.Security.CertificatePath) == false)
                     {
@@ -1466,10 +1493,7 @@ namespace Raven.Server.ServerWide
                     {
                         try
                         {
-                            Secrets.NotifyExecutableOfCertificateChange(Configuration.Security.CertificateChangeExec,
-                                Configuration.Security.CertificateChangeExecArguments,
-                                certBase64,
-                                this);
+                            Secrets.NotifyExecutableOfCertificateChange(Configuration.Security.CertificateChangeExec, Configuration.Security.CertificateChangeExecArguments, certBase64);
                         }
                         catch (Exception e)
                         {
@@ -1735,7 +1759,7 @@ namespace Raven.Server.ServerWide
             var tree = context.Transaction.InnerTransaction.CreateTree("SecretKeys");
             tree.Delete(name);
         }
-
+        
         public Task<(long Index, object Result)> DeleteDatabaseAsync(string db, bool hardDelete, string[] fromNodes, string raftRequestId)
         {
             var deleteCommand = new DeleteDatabaseCommand(db, raftRequestId)
@@ -2129,15 +2153,6 @@ namespace Raven.Server.ServerWide
         {
             var editRevisions = new EditRevisionsForConflictsConfigurationCommand(JsonDeserializationCluster.RevisionsCollectionConfiguration(configurationJson), name, raftRequestId);
             return SendToLeaderAsync(editRevisions);
-        }
-
-        public Task<(long, object)> ModifyTimeSeriesConfiguration(JsonOperationContext context, string name, BlittableJsonReaderObject configurationJson, string raftRequestId)
-        {
-            var configuration = JsonDeserializationCluster.TimeSeriesConfiguration(configurationJson);
-            configuration?.InitializeRollupAndRetention();
-            LicenseManager.AssertCanAddTimeSeriesRollupsAndRetention(configuration);
-            var editTimeSeries = new EditTimeSeriesConfigurationCommand(configuration, name, raftRequestId);
-            return SendToLeaderAsync(editTimeSeries);
         }
 
         public async Task<(long, object)> PutConnectionString(TransactionOperationContext context, string databaseName, BlittableJsonReaderObject connectionString, string raftRequestId)
@@ -2548,6 +2563,18 @@ namespace Raven.Server.ServerWide
                 }
             }
 
+            var numberOfSubscriptionConnections = database.SubscriptionStorage.GetNumberOfRunningSubscriptions();
+            if (statistics != null)
+                statistics.NumberOfSubscriptionConnections = numberOfSubscriptionConnections;
+
+            if (numberOfSubscriptionConnections > 0)
+            {
+                if (statistics == null)
+                    return false;
+
+                statistics.Explanations.Add($"Cannot unload database because number of Subscriptions connections ({numberOfSubscriptionConnections}) is greater than 0");
+            }
+
             var hasActiveOperations = database.Operations.HasActive;
             if (statistics != null)
                 statistics.HasActiveOperations = hasActiveOperations;
@@ -2568,7 +2595,7 @@ namespace Raven.Server.ServerWide
             return true;
         }
 
-        private static bool DatabaseNeedsToRunIdleOperations(DocumentDatabase database, out DatabaseCleanupMode mode)
+        private bool DatabaseNeedsToRunIdleOperations(DocumentDatabase database, out DatabaseCleanupMode mode)
         {
             var now = DateTime.UtcNow;
 
@@ -2582,13 +2609,13 @@ namespace Raven.Server.ServerWide
                     maxLastWork = env.Environment.LastWorkTime;
             }
 
-            if ((now - maxLastWork).TotalMinutes > 5)
+            if ((now - maxLastWork).CompareTo(database.Configuration.Databases.DeepCleanupThreshold.AsTimeSpan) > 0)
             {
                 mode = DatabaseCleanupMode.Deep;
                 return true;
             }
 
-            if ((now - database.LastIdleTime).TotalMinutes > 10)
+            if ((now - database.LastIdleTime).CompareTo(database.Configuration.Databases.RegularCleanupThreshold.AsTimeSpan) > 0)
             {
                 mode = DatabaseCleanupMode.Regular;
                 return true;
@@ -3037,7 +3064,7 @@ namespace Raven.Server.ServerWide
 
         private ClusterRequestExecutor CreateNewClusterRequestExecutor(string leaderUrl)
         {
-            var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leaderUrl, Server.Certificate.Certificate);
+            var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leaderUrl, Server.Certificate.Certificate, DocumentConventions.DefaultForServer);
             requestExecutor.DefaultTimeout = Engine.OperationTimeout;
 
             return requestExecutor;
@@ -3329,14 +3356,14 @@ namespace Raven.Server.ServerWide
             return json;
         }
 
-        public static IEnumerable<Client.ServerWide.Operations.MountPointUsage> GetMountPointUsageDetailsFor(StorageEnvironmentWithType environment, bool includeTempBuffers)
+        public IEnumerable<Client.ServerWide.Operations.MountPointUsage> GetMountPointUsageDetailsFor(StorageEnvironmentWithType environment, bool includeTempBuffers)
         {
             var fullPath = environment?.Environment.Options.BasePath.FullPath;
             if (fullPath == null)
                 yield break;
 
             var driveInfo = environment.Environment.Options.DriveInfoByPath?.Value;
-            var diskSpaceResult = DiskSpaceChecker.GetDiskSpaceInfo(fullPath, driveInfo?.BasePath);
+            var diskSpaceResult = DiskUtils.GetDiskSpaceInfo(fullPath, driveInfo?.BasePath);
             if (diskSpaceResult == null)
                 yield break;
 
@@ -3346,71 +3373,90 @@ namespace Raven.Server.ServerWide
                 Name = environment.Name,
                 Type = environment.Type.ToString(),
                 UsedSpace = sizeOnDisk.DataFileInBytes,
-                DiskSpaceResult = new Client.ServerWide.Operations.DiskSpaceResult
-                {
-                    DriveName = diskSpaceResult.DriveName,
-                    VolumeLabel = diskSpaceResult.VolumeLabel,
-                    TotalFreeSpaceInBytes = diskSpaceResult.TotalFreeSpace.GetValue(SizeUnit.Bytes),
-                    TotalSizeInBytes = diskSpaceResult.TotalSize.GetValue(SizeUnit.Bytes)
-                },
+                DiskSpaceResult = FillDiskSpaceResult(diskSpaceResult),
                 UsedSpaceByTempBuffers = 0
             };
+            
+            var ioStatsResult = Server.DiskStatsGetter.Get(driveInfo?.BasePath.DriveName);
+            if (ioStatsResult != null)
+                usage.IoStatsResult = FillIoStatsResult(ioStatsResult); 
 
-            var journalPathUsage = DiskSpaceChecker.GetDiskSpaceInfo(environment.Environment.Options.JournalPath?.FullPath, driveInfo?.JournalPath);
-            if (journalPathUsage != null)
+            if (diskSpaceResult.DriveName == driveInfo?.JournalPath.DriveName)
             {
-                if (diskSpaceResult.DriveName == journalPathUsage.DriveName)
+                usage.UsedSpace += sizeOnDisk.JournalsInBytes;
+                usage.UsedSpaceByTempBuffers += includeTempBuffers ? sizeOnDisk.TempRecyclableJournalsInBytes : 0;
+            }
+            else
+            {
+                var journalDiskSpaceResult = DiskUtils.GetDiskSpaceInfo(environment.Environment.Options.JournalPath?.FullPath, driveInfo?.JournalPath);
+                if (journalDiskSpaceResult != null)
                 {
-                    usage.UsedSpace += sizeOnDisk.JournalsInBytes;
-                    usage.UsedSpaceByTempBuffers += includeTempBuffers ? sizeOnDisk.TempRecyclableJournalsInBytes : 0;
-                }
-                else
-                {
-                    yield return new Client.ServerWide.Operations.MountPointUsage
+                    var journalUsage = new Client.ServerWide.Operations.MountPointUsage
                     {
                         Name = environment.Name,
                         Type = environment.Type.ToString(),
-                        DiskSpaceResult = new Client.ServerWide.Operations.DiskSpaceResult
-                        {
-                            DriveName = journalPathUsage.DriveName,
-                            VolumeLabel = journalPathUsage.VolumeLabel,
-                            TotalFreeSpaceInBytes = journalPathUsage.TotalFreeSpace.GetValue(SizeUnit.Bytes),
-                            TotalSizeInBytes = journalPathUsage.TotalSize.GetValue(SizeUnit.Bytes)
-                        },
+                        DiskSpaceResult = FillDiskSpaceResult(journalDiskSpaceResult),
                         UsedSpaceByTempBuffers = includeTempBuffers ? sizeOnDisk.TempRecyclableJournalsInBytes : 0
                     };
+                    var journalIoStatsResult = Server.DiskStatsGetter.Get(driveInfo?.JournalPath.DriveName);
+                    if (journalIoStatsResult != null)
+                        usage.IoStatsResult = FillIoStatsResult(ioStatsResult);  
+                    
+                    yield return journalUsage;
                 }
             }
 
             if (includeTempBuffers)
             {
-                var tempBuffersDiskSpaceResult = DiskSpaceChecker.GetDiskSpaceInfo(environment.Environment.Options.TempPath.FullPath, driveInfo?.TempPath);
-                if (tempBuffersDiskSpaceResult != null)
+                if (diskSpaceResult.DriveName == driveInfo?.TempPath.DriveName)
                 {
-                    if (diskSpaceResult.DriveName == tempBuffersDiskSpaceResult.DriveName)
+                    usage.UsedSpaceByTempBuffers += sizeOnDisk.TempBuffersInBytes;
+                }
+                else
+                {
+                    var tempBuffersDiskSpaceResult = DiskUtils.GetDiskSpaceInfo(environment.Environment.Options.TempPath.FullPath, driveInfo?.TempPath);
+                    if (tempBuffersDiskSpaceResult != null)
                     {
-                        usage.UsedSpaceByTempBuffers += sizeOnDisk.TempBuffersInBytes;
-                    }
-                    else
-                    {
-                        yield return new Client.ServerWide.Operations.MountPointUsage
+                        var tempBuffersUsage = new Client.ServerWide.Operations.MountPointUsage
                         {
                             Name = environment.Name,
                             Type = environment.Type.ToString(),
                             UsedSpaceByTempBuffers = sizeOnDisk.TempBuffersInBytes,
-                            DiskSpaceResult = new Client.ServerWide.Operations.DiskSpaceResult
-                            {
-                                DriveName = tempBuffersDiskSpaceResult.DriveName,
-                                VolumeLabel = tempBuffersDiskSpaceResult.VolumeLabel,
-                                TotalFreeSpaceInBytes = tempBuffersDiskSpaceResult.TotalFreeSpace.GetValue(SizeUnit.Bytes),
-                                TotalSizeInBytes = tempBuffersDiskSpaceResult.TotalSize.GetValue(SizeUnit.Bytes)
-                            }
+                            DiskSpaceResult = FillDiskSpaceResult(tempBuffersDiskSpaceResult)
                         };
+                        var tempBufferIoStatsResult = Server.DiskStatsGetter.Get(driveInfo?.TempPath.DriveName);
+                        if (tempBufferIoStatsResult != null)
+                            tempBuffersUsage.IoStatsResult = FillIoStatsResult(ioStatsResult);  
+
+                        yield return tempBuffersUsage;
                     }
                 }
             }
 
             yield return usage;
+        }
+
+        private static Client.ServerWide.Operations.DiskSpaceResult FillDiskSpaceResult(Sparrow.Server.Utils.DiskSpaceResult journalDiskSpaceResult)
+        {
+            return new Client.ServerWide.Operations.DiskSpaceResult
+            {
+                DriveName = journalDiskSpaceResult.DriveName,
+                VolumeLabel = journalDiskSpaceResult.VolumeLabel,
+                TotalFreeSpaceInBytes = journalDiskSpaceResult.TotalFreeSpace.GetValue(SizeUnit.Bytes),
+                TotalSizeInBytes = journalDiskSpaceResult.TotalSize.GetValue(SizeUnit.Bytes)
+            };
+        }
+
+        internal static IoStatsResult FillIoStatsResult(DiskStatsResult ioStatsResult)
+        {
+            return new IoStatsResult
+            {
+                IoReadOperations = ioStatsResult.IoReadOperations, 
+                IoWriteOperations = ioStatsResult.IoWriteOperations,
+                ReadThroughputInKb = ioStatsResult.ReadThroughput.GetValue(SizeUnit.Kilobytes),
+                WriteThroughputInKb = ioStatsResult.WriteThroughput.GetValue(SizeUnit.Kilobytes),
+                QueueLength = ioStatsResult.QueueLength,
+            };
         }
 
         internal TestingStuff ForTestingPurposes;

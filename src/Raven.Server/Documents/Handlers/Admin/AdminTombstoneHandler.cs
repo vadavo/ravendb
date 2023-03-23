@@ -1,5 +1,6 @@
 ﻿using System.Threading.Tasks;
 using Raven.Server.Routing;
+using Raven.Server.Utils;
 using Sparrow.Json;
 
 namespace Raven.Server.Documents.Handlers.Admin
@@ -28,15 +29,27 @@ namespace Raven.Server.Documents.Handlers.Admin
         [RavenAction("/databases/*/admin/tombstones/state", "GET", AuthorizationStatus.DatabaseAdmin, IsDebugInformationEndpoint = true)]
         public async Task State()
         {
-            var state = Database.TombstoneCleaner.GetState();
+            var state = Database.TombstoneCleaner.GetState(addInfoForDebug: true);
 
             using (Database.DocumentsStorage.ContextPool.AllocateOperationContext(out JsonOperationContext context))
             {
-                await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+                await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context, ServerStore, ResponseBodyStream()))
                 {
                     writer.WriteStartObject();
 
-                    writer.WriteArray(context, "Results", state, (w, c, v) =>
+                    writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.MinAllDocsEtag));
+                    writer.WriteInteger(state.MinAllDocsEtag);
+                    writer.WriteComma();
+
+                    writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.MinAllTimeSeriesEtag));
+                    writer.WriteInteger(state.MinAllTimeSeriesEtag);
+                    writer.WriteComma();
+
+                    writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.MinAllCountersEtag));
+                    writer.WriteInteger(state.MinAllCountersEtag);
+                    writer.WriteComma();
+
+                    writer.WriteArray(context, "Results", state.Tombstones, (w, c, v) =>
                     {
                         w.WriteStartObject();
 
@@ -62,9 +75,54 @@ namespace Raven.Server.Documents.Handlers.Admin
                         w.WritePropertyName(nameof(v.Value.TimeSeries.Etag));
                         w.WriteInteger(v.Value.TimeSeries.Etag);
                         w.WriteEndObject();
+                        w.WriteComma();
+
+                        w.WritePropertyName(nameof(v.Value.Counters));
+                        w.WriteStartObject();
+                        w.WritePropertyName(nameof(v.Value.Counters.Component));
+                        w.WriteString(v.Value.Counters.Component);
+                        w.WriteComma();
+                        w.WritePropertyName(nameof(v.Value.Counters.Etag));
+                        w.WriteInteger(v.Value.Counters.Etag);
+                        w.WriteEndObject();
 
                         w.WriteEndObject();
                     });
+
+                    writer.WriteComma();
+
+                    writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.PerSubscriptionInfo));
+                    writer.WriteStartArray();
+                    if (state.PerSubscriptionInfo != null)
+                    {
+                        var first = true;
+
+                        foreach (var info in state.PerSubscriptionInfo)
+                        {
+                            if (first == false)
+                                writer.WriteComma();
+
+                            first = false;
+
+                            writer.WriteStartObject();
+
+                            writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.SubscriptionInfo.Identifier));
+                            writer.WriteString(info.Identifier);
+                            writer.WriteComma();
+                            writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.SubscriptionInfo.Type));
+                            writer.WriteString(info.Type.ToString());
+                            writer.WriteComma();
+                            writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.SubscriptionInfo.Collection));
+                            writer.WriteString(info.Collection);
+                            writer.WriteComma();
+                            writer.WritePropertyName(nameof(TombstoneCleaner.TombstonesState.SubscriptionInfo.Etag));
+                            writer.WriteInteger(info.Etag);
+
+                            writer.WriteEndObject();
+                        }
+                    }
+
+                    writer.WriteEndArray();
 
                     writer.WriteEndObject();
                 }

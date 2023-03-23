@@ -246,7 +246,15 @@ namespace Raven.Server.Documents.Operations
                         if (active.Killable)
                             active.Token.Cancel();
 
-                        active.Task?.Wait();
+                        var task = active.Task;
+
+                        if (task == null)
+                            return;
+
+                        if (task.Status is TaskStatus.WaitingToRun)
+                            return; // execution has not even started yet
+
+                        task.Wait(TimeSpan.FromSeconds(30));
                     }
                     catch (Exception)
                     {
@@ -469,7 +477,10 @@ namespace Raven.Server.Documents.Operations
             DebugPackage,
 
             [Description("Dump Raw Index Data - Debug")]
-            DumpRawIndexData
+            DumpRawIndexData,
+            
+            [Description("Lucene: optimize index")]
+            LuceneOptimizeIndex
         }
     }
 }

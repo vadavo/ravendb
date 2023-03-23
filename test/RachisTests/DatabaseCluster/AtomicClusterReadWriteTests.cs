@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
 using FastTests.Server.Replication;
@@ -19,7 +20,9 @@ using Raven.Client.Util;
 using Raven.Server;
 using Raven.Server.Config;
 using Sparrow.Extensions;
+using Sparrow.Logging;
 using Sparrow.Server;
+using Tests.Infrastructure.Utils;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -620,8 +623,7 @@ namespace RachisTests.DatabaseCluster
 
             for (int i = 0; i < urls.Length; i++)
             {
-                var store = new DocumentStore {Urls = new[] {urls[i]}, Database = database, Conventions = new DocumentConventions {DisableTopologyUpdates = true}}
-                    .Initialize();
+                var store = new DocumentStore { Urls = new[] { urls[i] }, Database = database, Conventions = new DocumentConventions { DisableTopologyUpdates = true } }.Initialize();
                 stores[i] = store;
             }
 

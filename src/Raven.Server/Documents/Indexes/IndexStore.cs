@@ -36,6 +36,7 @@ using Raven.Server.Documents.Indexes.Static.TimeSeries;
 using Raven.Server.Documents.Queries.Dynamic;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
+using Raven.Server.Rachis;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Commands.Indexes;
 using Raven.Server.ServerWide.Context;
@@ -420,6 +421,10 @@ namespace Raven.Server.Documents.Indexes
 
                 try
                 {
+                    if (definition.Name.StartsWith(Constants.Documents.Indexing.SideBySideIndexNamePrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException($"Index name cannot start with {Constants.Documents.Indexing.SideBySideIndexNamePrefix} but got {definition.Name} of index {name}");
+                    }
                     var indexToStart = HandleStaticIndexChange(name, definition);
                     if (indexToStart != null)
                     {
@@ -605,6 +610,10 @@ namespace Raven.Server.Documents.Indexes
 
                     return null;
                 }
+
+                var definitionClone = new IndexDefinition();
+                definition.CopyTo(definitionClone);
+                definition = definitionClone;
 
                 if (creationOptions == IndexCreationOptions.UpdateWithoutUpdatingCompiledIndex)
                 {
@@ -2547,6 +2556,7 @@ namespace Raven.Server.Documents.Indexes
             internal Action DuringIndexReplacement_OnOldIndexDeletion;
             internal Action AfterIndexesOpen;
             internal Action<string> AfterIndexCreation;
+            internal Action IndexCompaction;
 
             internal Action<Index> OnRollingIndexFinished;
             internal Action<Index> BeforeRollingIndexFinished;
@@ -2555,6 +2565,7 @@ namespace Raven.Server.Documents.Indexes
 
             internal Action<Index> BeforeIndexThreadExit;
             internal Action<Index> BeforeIndexStart;
+
             public TestingStuff(IndexStore parent)
             {
                 _parent = parent;

@@ -8,8 +8,8 @@ using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
-using JetBrains.Annotations;
 using System.Threading.Tasks;
+using JetBrains.Annotations;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Replication;
@@ -21,7 +21,9 @@ using Raven.Client.Extensions;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Tcp;
 using Raven.Client.Util;
+using Raven.Server.Documents.Replication.ReplicationItems;
 using Raven.Server.Documents.TcpHandlers;
+using Raven.Server.Exceptions;
 using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
@@ -36,6 +38,7 @@ using Sparrow.Logging;
 using Sparrow.Server;
 using Sparrow.Threading;
 using Sparrow.Utils;
+using Voron;
 
 namespace Raven.Server.Documents.Replication
 {
@@ -356,6 +359,10 @@ namespace Raven.Server.Documents.Replication
                 _parent.ForTestingPurposes?.OnOutgoingReplicationStart?.Invoke(this);
                 replicationAction();
             }
+            catch (MissingAttachmentException e)
+            {
+                HandleException(e);
+            }
             catch (AggregateException e)
             {
                 if (e.InnerExceptions.Count == 1)
@@ -432,6 +439,7 @@ namespace Raven.Server.Documents.Replication
         }
 
         public long NextReplicateTicks;
+        public int MissingAttachmentsRetries;
 
         private void Replicate()
         {
@@ -954,7 +962,7 @@ namespace Raven.Server.Documents.Replication
                 return result.IsValid ? 1 : 0;
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 return new UpdateSiblingCurrentEtagDto
                 {
@@ -1162,6 +1170,13 @@ namespace Raven.Server.Documents.Replication
                     throw new InvalidOperationException(
                         $"Received failure reply for replication batch. Error string received = {replicationBatchReply.Exception}");
                 case ReplicationMessageReply.ReplyType.MissingAttachments:
+                    if (++MissingAttachmentsRetries > 1)
+                    {
+                        var msg = $"Failed to send batch successfully to {Destination.FromString()}. " +
+                                  $"Destination reported missing attachments {MissingAttachmentsRetries} times.";
+                        RaiseAlertAndThrowMissingAttachmentException(msg, replicationBatchReply.Exception);
+                    }
+
                     if (_log.IsInfoEnabled)
                     {
                         _log.Info(
@@ -1176,6 +1191,28 @@ namespace Raven.Server.Documents.Replication
             }
 
             return replicationBatchReply;
+        }
+
+        private AlertRaised _missingAttachmentsAlert;
+
+        private void RaiseAlertAndThrowMissingAttachmentException(string msg, string exceptionDetails)
+        {
+            if (_log.IsInfoEnabled)
+            {
+                _log.Info(
+                    $"Received reply for replication batch from {Destination.FromString()}. Error string received = {msg}");
+            }
+
+            _missingAttachmentsAlert = AlertRaised.Create(
+                _database.Name,
+                "Replication delay due to a missing attachments loop",
+                msg + $"{Environment.NewLine}Please try to delete the missing attachment from '{_database.Name}' (see additional information regarding the document and attachment below)",
+                AlertType.Replication,
+                NotificationSeverity.Error,
+                details: new ExceptionDetails { Exception = exceptionDetails});
+            _parent.Database.NotificationCenter.Add(_missingAttachmentsAlert);
+
+            throw new MissingAttachmentException($"{msg}.{Environment.NewLine}{exceptionDetails}");
         }
 
         private void OnDocumentChange(DocumentChange change)
@@ -1266,7 +1303,17 @@ namespace Raven.Server.Documents.Replication
 
         private void OnSuccessfulTwoWaysCommunication() => SuccessfulTwoWaysCommunication?.Invoke(this);
 
-        private void OnSuccessfulReplication() => SuccessfulReplication?.Invoke(this);
+        private void OnSuccessfulReplication()
+        {
+            SuccessfulReplication?.Invoke(this);
+            if (_missingAttachmentsAlert != null)
+            {
+                _parent.Database.NotificationCenter.Dismiss(_missingAttachmentsAlert.Id);
+                _missingAttachmentsAlert = null;
+            }
+         
+            MissingAttachmentsRetries = 0;
+        }
 
         internal TestingStuff ForTestingPurposes;
 
@@ -1281,6 +1328,8 @@ namespace Raven.Server.Documents.Replication
         internal class TestingStuff
         {
             public Action OnDocumentSenderFetchNewItem;
+
+            public Action<Dictionary<Slice, AttachmentReplicationItem>> OnMissingAttachmentStream;
         }
     }
 

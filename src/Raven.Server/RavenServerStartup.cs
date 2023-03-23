@@ -30,6 +30,7 @@ using Raven.Server.Routing;
 using Raven.Server.ServerWide;
 using Raven.Server.TrafficWatch;
 using Raven.Server.Web;
+using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
@@ -177,25 +178,27 @@ namespace Raven.Server
             }
             catch (Exception e)
             {
-                sp?.Stop();
-                exception = e;
-
-                CheckVersionAndWrapException(context, ref e);
-
-                MaybeSetExceptionStatusCode(context, _server.ServerStore, e);
-
-                if (context.RequestAborted.IsCancellationRequested)
-                    return;
-
-                using (_server.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext ctx))
+                try
                 {
-                    var djv = new DynamicJsonValue
+                    sp?.Stop();
+                    exception = e;
+
+                    CheckVersionAndWrapException(context, ref e);
+
+                    MaybeSetExceptionStatusCode(context, _server.ServerStore, e);
+
+                    if (context.RequestAborted.IsCancellationRequested)
+                        return;
+
+                    using (_server.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext ctx))
                     {
-                        [nameof(ExceptionDispatcher.ExceptionSchema.Url)] = $"{context.Request.Path}{context.Request.QueryString}",
-                        [nameof(ExceptionDispatcher.ExceptionSchema.Type)] = e.GetType().FullName,
-                        [nameof(ExceptionDispatcher.ExceptionSchema.Message)] = e.Message,
-                        [nameof(ExceptionDispatcher.ExceptionSchema.Error)] = e.ToString()
-                    };
+                        var djv = new DynamicJsonValue
+                        {
+                            [nameof(ExceptionDispatcher.ExceptionSchema.Url)] = $"{context.Request.Path}{context.Request.QueryString}",
+                            [nameof(ExceptionDispatcher.ExceptionSchema.Type)] = e.GetType().FullName,
+                            [nameof(ExceptionDispatcher.ExceptionSchema.Message)] = e.Message,
+                            [nameof(ExceptionDispatcher.ExceptionSchema.Error)] = e.ToString()
+                        };
 
 #if EXCEPTION_ERROR_HUNT
                     var f = Guid.NewGuid() + ".error";
@@ -203,17 +206,27 @@ namespace Raven.Server
                         $"{context.Request.Path}{context.Request.QueryString}" + Environment.NewLine + errorString);
 #endif
 
-                    MaybeAddAdditionalExceptionData(djv, e);
+                        MaybeAddAdditionalExceptionData(djv, e);
 
-                    await using (var writer = new AsyncBlittableJsonTextWriter(ctx, context.Response.Body))
-                    {
-                        var json = ctx.ReadObject(djv, "exception");
-                        writer.WriteObject(json);
-                    }
+                        await using (var writer = new AsyncBlittableJsonTextWriter(ctx, context.Response.Body))
+                        {
+                            var json = ctx.ReadObject(djv, "exception");
+                            writer.WriteObject(json);
+                        }
 
 #if EXCEPTION_ERROR_HUNT
                     File.Delete(f);
 #endif
+                    }
+                }
+                catch (Exception internalException)
+                {
+                    if (_logger.IsOperationsEnabled)
+                    {
+                        _logger.Operations($"Error during error handling of a failed request. Original error: {e}", internalException);
+                    }
+
+                    throw;
                 }
             }
             finally
@@ -300,13 +313,14 @@ namespace Raven.Server
                 Type = twTuple.Type,
                 ClientIP = context.Connection.RemoteIpAddress?.ToString(),
                 CertificateThumbprint = context.Connection.ClientCertificate?.Thumbprint,
-                ResponseSizeInBytes = ((StreamWithTimeout)context.Items["ResponseStream"])?.TotalWritten ?? 0
+                RequestSizeInBytes = ((StreamWithTimeout)context.Items["RequestStream"])?.TotalRead ?? 0,
+                ResponseSizeInBytes = ((StreamWithTimeout)context.Items["ResponseStream"])?.TotalWritten ?? 0,
             };
 
             TrafficWatchManager.DispatchMessage(twn);
         }
 
-        private void MaybeAddAdditionalExceptionData(DynamicJsonValue djv, Exception exception)
+        private static void MaybeAddAdditionalExceptionData(DynamicJsonValue djv, Exception exception)
         {
             if (exception is IndexCompilationException indexCompilationException)
             {
@@ -326,6 +340,11 @@ namespace Raven.Server
                 djv[nameof(ConcurrencyException.Id)] = concurrencyException.Id;
                 djv[nameof(ConcurrencyException.ExpectedChangeVector)] = concurrencyException.ExpectedChangeVector;
                 djv[nameof(ConcurrencyException.ActualChangeVector)] = concurrencyException.ActualChangeVector;
+            }
+
+            if (exception is RavenTimeoutException timeoutException)
+            {
+                djv[nameof(RavenTimeoutException.FailImmediately)] = timeoutException.FailImmediately;
             }
 
             if (exception is ClusterTransactionConcurrencyException { ConcurrencyViolations: { } } ctxConcurrencyException)
@@ -372,7 +391,7 @@ namespace Raven.Server
                 exception is DatabaseConcurrentLoadTimeoutException ||
                 exception is NodeIsPassiveException ||
                 exception is ClientVersionMismatchException ||
-                exception is DatabaseSchemaErrorException || 
+                exception is DatabaseSchemaErrorException ||
                 exception is DatabaseIdleException
                 )
             {
@@ -399,7 +418,7 @@ namespace Raven.Server
                 return;
             }
 
-            if (exception is TimeoutException)
+            if (exception is TimeoutException or RavenTimeoutException)
             {
                 response.StatusCode = (int)HttpStatusCode.RequestTimeout;
                 return;
@@ -415,6 +434,12 @@ namespace Raven.Server
             {
                 response.StatusCode = (int)HttpStatusCode.Gone;
                 response.Headers.Add("Cache-Control", new Microsoft.Extensions.Primitives.StringValues(new[] { "must-revalidate", "no-cache" }));
+                return;
+            }
+
+            if (exception is IndexCompactionInProgressException)
+            {
+                response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
                 return;
             }
 

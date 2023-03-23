@@ -49,12 +49,14 @@ using Raven.Client.ServerWide.Operations.Integrations.PostgreSQL;
 using Raven.Client.ServerWide.Operations.Logs;
 using Raven.Client.ServerWide.Operations.Migration;
 using Raven.Client.ServerWide.Operations.OngoingTasks;
+using Raven.Client.ServerWide.Operations.TrafficWatch;
 using Raven.Client.Util;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
 using Raven.Server.Dashboard;
 using Raven.Server.Dashboard.Cluster;
 using Raven.Server.Dashboard.Cluster.Notifications;
+using Raven.Server.Documents;
 using Raven.Server.Documents.ETL;
 using Raven.Server.Documents.ETL.Providers.ElasticSearch.Test;
 using Raven.Server.Documents.ETL.Providers.OLAP;
@@ -143,6 +145,7 @@ namespace TypingsGenerator
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(ConcurrentQueue<>))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(IReadOnlyList<>))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(IReadOnlyCollection<>))
+                .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(SortedSet<>))
                 .WithTypeMapping(new TsInterface(new TsName("dictionary<Raven.Client.Documents.Queries.Timings.QueryTimings>")),
                     typeof(IDictionary<string, QueryTimings>))
                 .WithTypeMapping(new TsInterface(new TsName("dictionary<Raven.Server.NotificationCenter.Notifications.Details.HugeDocumentInfo>")),
@@ -278,12 +281,16 @@ namespace TypingsGenerator
             scripter.AddType(typeof(StudioTasksHandler.FormattedExpression));
             scripter.AddType(typeof(StudioIndexHandler.IndexTypeInfo));
             scripter.AddType(typeof(AdminIndexHandler.DumpIndexResult));
+            scripter.AddType(typeof(IndexOptimizeResult));
             scripter.AddType(typeof(StudioDatabaseTasksHandler.IndexDefaults));
 
             // cluster
             scripter.AddType(typeof(ClusterTopology));
             scripter.AddType(typeof(ClusterObserverDecisions));
-            scripter.AddType(typeof(NodeInfo));
+            scripter.AddType(typeof(Raven.Client.ServerWide.Commands.NodeInfo));
+            scripter.AddType(typeof(Raven.Server.Commercial.NodeInfo));
+            scripter.AddType(typeof(SetupInfo));
+            scripter.AddType(typeof(UnsecuredSetupInfo));
 
             // query
             scripter.AddType(typeof(QueryResult<,>));
@@ -329,6 +336,7 @@ namespace TypingsGenerator
             scripter.AddType(typeof(IndexingSpeed));
             scripter.AddType(typeof(MachineResources));
             scripter.AddType(typeof(DrivesUsage));
+            scripter.AddType(typeof(RachisState));
             
             // cluster dashboard
             scripter.AddType(typeof(WidgetRequest));
@@ -337,6 +345,7 @@ namespace TypingsGenerator
             scripter.AddType(typeof(ServerTimePayload));
             scripter.AddType(typeof(MemoryUsagePayload));
             scripter.AddType(typeof(StorageUsagePayload));
+            scripter.AddType(typeof(IoStatsPayload));
             scripter.AddType(typeof(DatabaseIndexingSpeedPayload));
             scripter.AddType(typeof(DatabaseStorageUsagePayload));
             scripter.AddType(typeof(IndexingSpeedPayload));
@@ -344,6 +353,7 @@ namespace TypingsGenerator
             scripter.AddType(typeof(DatabaseTrafficWatchPayload));
             scripter.AddType(typeof(DatabaseOverviewPayload));
             scripter.AddType(typeof(OngoingTasksPayload));
+            scripter.AddType(typeof(ClusterOverviewPayload));
 
             // expiration
             scripter.AddType(typeof(ExpirationConfiguration));
@@ -507,7 +517,8 @@ namespace TypingsGenerator
             // admin logs
             scripter.AddType(typeof(LogMode));
             scripter.AddType(typeof(SetLogsConfigurationOperation.Parameters));
-
+            scripter.AddType(typeof(PutTrafficWatchConfigurationOperation.Parameters));
+            
             // adminJs console
             scripter.AddType(typeof(AdminJsScript));
 
@@ -552,6 +563,7 @@ namespace TypingsGenerator
             // debug
             scripter.AddType(typeof(ThreadsInfo));
             scripter.AddType(typeof(MemoryDebugHandler.MemoryInfo));
+            scripter.AddType(typeof(TombstoneCleaner.TombstonesState));
 
             // counters
             scripter.AddType(typeof(CounterBatch));

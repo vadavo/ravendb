@@ -9,7 +9,6 @@ using System.Threading.Tasks;
 using Raven.Client.Exceptions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
-using Raven.Client.ServerWide.Tcp;
 using Raven.Server.Rachis.Remote;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
@@ -17,8 +16,8 @@ using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Binary;
 using Sparrow.Json;
-using Sparrow.Server.Utils;
 using Sparrow.Threading;
+using Sparrow.Utils;
 using Voron;
 using Voron.Data;
 using Voron.Data.BTrees;
@@ -157,17 +156,7 @@ namespace Raven.Server.Rachis
 
             try
             {
-                try
-                {
-                    Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
-                }
-                catch (Exception e)
-                {
-                    if (_engine.Log.IsInfoEnabled)
-                    {
-                        _engine.Log.Info($"{ToString()} was unable to set the thread priority, will continue with the same priority", e);
-                    }
-                }
+                ThreadHelper.TrySetThreadPriority(ThreadPriority.AboveNormal, ToString(), _engine.Log);
 
                 var connectionBroken = false;
                 var obtainConnectionFailure = false;

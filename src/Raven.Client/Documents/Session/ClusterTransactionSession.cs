@@ -8,6 +8,8 @@ using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Operations.CompareExchange;
 using Raven.Client.Documents.Session.Operations.Lazy;
+using Raven.Client.Extensions;
+using Raven.Client.Json;
 using Raven.Client.Json.Serialization;
 using Raven.Client.Util;
 using Sparrow.Json;
@@ -238,6 +240,9 @@ namespace Raven.Client.Documents.Session
         {
             Debug.Assert(value != null, "value != null");
 
+            if (value.Key.StartsWith(Constants.CompareExchange.RvnAtomicPrefix, StringComparison.InvariantCultureIgnoreCase))
+                throw new InvalidOperationException($"'{value.Key}' is an atomic guard and you cannot load it via the session");
+
             if (_session.NoTracking)
                 return new CompareExchangeSessionValue(value);
 
@@ -329,7 +334,7 @@ namespace Raven.Client.Documents.Session
                                     entity = conventions.Serialization.DefaultConverter.FromBlittable<T>(_originalValue.Value, _key);
                             }
 
-                            var value = new CompareExchangeValue<T>(_key, _index, entity);
+                            var value = new CompareExchangeValue<T>(_key, _index, entity, _originalValue?.Metadata);
                             _value = value;
 
                             return value;
@@ -390,19 +395,30 @@ namespace Raven.Client.Documents.Session
                         var entity = CompareExchangeValueBlittableJsonConverter.ConvertToBlittable(_value.Value, conventions, context, jsonSerializer);
                         var entityJson = entity as BlittableJsonReaderObject;
                         BlittableJsonReaderObject metadata = null;
+                        _originalValue?.Value?.TryGet(Constants.Documents.Metadata.Key, out metadata);
+                        var metadataHasChanged = false;
                         if (_value.HasMetadata && _value.Metadata.Count != 0)
                         {
-                            metadata = PrepareMetadataForPut(_key, _value.Metadata, conventions, context);
+                            if (metadata == null)
+                            {
+                                metadataHasChanged = true;
+                                metadata = PrepareMetadataForPut(_key, _value.Metadata, conventions, context); //create new metadata (because there wasn't any metadata before)
+                            }
+                            else
+                            {
+                                ValidateMetadataForPut(_key, _value.Metadata);
+                                metadataHasChanged = InMemoryDocumentSessionOperations.UpdateMetadataModifications(_value.Metadata, metadata); //add modifications to the existing metadata
+                            }
                         }
 
                         BlittableJsonReaderObject entityToInsert = null;
 
-                        if (entityJson == null)
+                        if (entityJson == null || metadataHasChanged)
                             entityJson = entityToInsert = ConvertEntity(_key, entity, metadata);
 
                         var newValue = new CompareExchangeValue<BlittableJsonReaderObject>(_key, _index, entityJson);
 
-                        var hasChanged = _originalValue == null || HasChanged(_originalValue, newValue);
+                        var hasChanged = _originalValue == null || metadataHasChanged || HasChanged(_originalValue, newValue);
                         _originalValue = newValue;
 
                         if (hasChanged == false)
@@ -490,19 +506,24 @@ namespace Raven.Client.Documents.Session
 
             internal static BlittableJsonReaderObject PrepareMetadataForPut(string key, IMetadataDictionary metadataDictionary, DocumentConventions conventions, JsonOperationContext context)
             {
-                if (metadataDictionary.TryGetValue(Constants.Documents.Metadata.Expires, out object obj))
-                {
-                    if (obj == null)
-                        ThrowInvalidExpiresMetadata($"The value of {Constants.Documents.Metadata.Expires} metadata for compare exchange '{key}' is null.");
-                    if (obj is DateTime == false && obj is string == false)
-                        ThrowInvalidExpiresMetadata($"The type of {Constants.Documents.Metadata.Expires} metadata for compare exchange '{key}' is not valid. Use the following type: {nameof(DateTime)} or {nameof(String)}");
-                }
+                ValidateMetadataForPut(key, metadataDictionary);
 
                 using (var writer = conventions.Serialization.CreateWriter(context))
                 {
                     writer.WriteMetadata(metadataDictionary);
                     writer.FinalizeDocument();
                     return writer.CreateReader();
+                }
+            }
+
+            private static void ValidateMetadataForPut(string key, IMetadataDictionary metadataDictionary)
+            {
+                if (metadataDictionary.TryGetValue(Constants.Documents.Metadata.Expires, out object obj))
+                {
+                    if (obj == null)
+                        ThrowInvalidExpiresMetadata($"The value of {Constants.Documents.Metadata.Expires} metadata for compare exchange '{key}' is null.");
+                    if (obj is DateTime == false && obj is string == false)
+                        ThrowInvalidExpiresMetadata($"The type of {Constants.Documents.Metadata.Expires} metadata for compare exchange '{key}' is not valid. Use the following type: {nameof(DateTime)} or {nameof(String)}");
                 }
             }
 

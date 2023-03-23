@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net6.0</TargetFramework>
-    <RuntimeFrameworkVersion>6.0.4</RuntimeFrameworkVersion>
+    <RuntimeFrameworkVersion>6.0.12</RuntimeFrameworkVersion>
     <AssemblyName>Tests.Infrastructure</AssemblyName>
     <PackageId>Tests.Infrastructure</PackageId>
     <CodeAnalysisRuleSet>..\..\RavenDB.ruleset</CodeAnalysisRuleSet>
@@ -23,10 +23,11 @@
     <EmbeddedResource Include="Data\Northwind.4.2.ravendbdump" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="MongoDB.Driver" Version="2.15.0" />
-    <PackageReference Include="xRetry" Version="1.8.0" />
-    <PackageReference Include="xunit" Version="2.4.1" />
-    <PackageReference Include="xunit.runner.utility" Version="2.4.1" />
+    <PackageReference Include="JunitXml.TestLogger" Version="3.0.114" />
+    <PackageReference Include="MongoDB.Driver" Version="2.18.0" />
+    <PackageReference Include="xRetry" Version="1.9.0" />
+    <PackageReference Include="xunit" Version="2.4.2" />
+    <PackageReference Include="xunit.runner.utility" Version="2.4.2" />
     <PackageReference Include="XunitLogger" Version="4.0.991" />
   </ItemGroup>
   <ItemGroup>

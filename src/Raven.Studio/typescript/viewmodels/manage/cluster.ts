@@ -27,6 +27,7 @@ class cluster extends viewModelBase {
 
     topology = clusterTopologyManager.default.topology;
     accessManager = accessManager.default.clusterView;
+    aboutViewUrl = appUrl.forAbout();
 
     canDeleteNodes: KnockoutComputed<boolean>;
     canAddNodes: KnockoutComputed<boolean>;
@@ -161,7 +162,7 @@ class cluster extends viewModelBase {
             });
     }
 
-    stepDown(node: clusterNode) {
+    stepDown() {
         this.confirmationMessage("Are you sure?", `Do you want current leader to step down?`, {
             buttons: ["Cancel", "Step down"]
         })

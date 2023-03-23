@@ -9,6 +9,8 @@ using Raven.Client.ServerWide;
 using Raven.Client.Util;
 using Raven.Server.Documents.Patch;
 using Raven.Server.NotificationCenter.Notifications;
+using Raven.Server.NotificationCenter.Notifications.Details;
+using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents;
 using Raven.Server.Utils;
@@ -207,7 +209,7 @@ namespace Raven.Server.Documents.Replication
                 return count;
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 // The LowerId created as in memory LazyStringValue that doesn't have escape characters
                 // so EscapePositions set to empty to avoid reference to escape bytes (after string bytes) while serializing
@@ -409,24 +411,44 @@ namespace Raven.Server.Documents.Replication
             out DocumentConflict resolvedConflict)
         {
             resolvedConflict = null;
-
-            if (ValidatedResolveByScriptInput(scriptResolver, conflicts, collection) == false)
-                return false;
-
-            var patch = new PatchConflict(_database, conflicts);
-            var updatedConflict = conflicts[0];
-            var patchRequest = new PatchRequest(scriptResolver.Script, PatchRequestType.Conflict);
-            if (patch.TryResolveConflict(context, patchRequest, out BlittableJsonReaderObject resolved) == false)
+            DocumentConflict updatedConflict = null;
+            try
             {
-                return false;
+                if (ValidatedResolveByScriptInput(scriptResolver, conflicts, collection) == false)
+                    return false;
+
+                var patch = new PatchConflict(_database, conflicts);
+                updatedConflict = conflicts[0];
+                var patchRequest = new PatchRequest(scriptResolver.Script, PatchRequestType.Conflict);
+                if (patch.TryResolveConflict(context, patchRequest, out BlittableJsonReaderObject resolved) == false)
+                {
+                    return false;
+                }
+
+                updatedConflict.Doc = resolved;
+                updatedConflict.Collection = collection;
+                updatedConflict.ChangeVector = ChangeVectorUtils.MergeVectors(conflicts.Select(c => c.ChangeVector).ToList());
+                resolvedConflict = updatedConflict;
+
+                return true;
             }
-
-            updatedConflict.Doc = resolved;
-            updatedConflict.Collection = collection;
-            updatedConflict.ChangeVector = ChangeVectorUtils.MergeVectors(conflicts.Select(c => c.ChangeVector).ToList());
-            resolvedConflict = updatedConflict;
-
-            return true;
+            catch (Exception e)
+            {
+                var msg = $"Script failed to resolve the conflict in doc: {updatedConflict?.Id} because exception was raised in it.";
+                if (_log.IsInfoEnabled)
+                    _log.Info(msg, e);
+                
+                var alert = AlertRaised.Create(
+                    _database.Name,
+                    "User-provided conflict script raised an error during conflict resolution, manual intervention required!",
+                    msg,
+                    AlertType.Replication,
+                    NotificationSeverity.Error,
+                    details: new ExceptionDetails(e));
+                
+                _database.NotificationCenter.Add(alert);
+            }
+            return false;
         }
 
         public DocumentConflict ResolveToLatest(List<DocumentConflict> conflicts)

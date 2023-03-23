@@ -254,16 +254,27 @@ namespace Raven.Server.Documents.Revisions
         public RevisionsCollectionConfiguration GetRevisionsConfiguration(string collection, DocumentFlags flags = DocumentFlags.None)
         {
             if (Configuration == null)
-                return ConflictConfiguration.Default;
+            {
+                if (flags.Contain(DocumentFlags.Resolved) || flags.Contain(DocumentFlags.Conflicted))
+                {
+                    return ConflictConfiguration.Default;
+                }
+
+                return _emptyConfiguration;
+            }
 
             if (Configuration.Collections != null &&
                 Configuration.Collections.TryGetValue(collection, out RevisionsCollectionConfiguration configuration))
                 return configuration;
 
-            if (flags.Contain(DocumentFlags.Resolved) || flags.Contain(DocumentFlags.Conflicted))
+            if (Configuration.Default == null)
             {
-                return ConflictConfiguration.Default;
+                if (flags.Contain(DocumentFlags.Resolved) || flags.Contain(DocumentFlags.Conflicted))
+                {
+                    return ConflictConfiguration.Default;
+                }
             }
+
             return Configuration.Default ?? _emptyConfiguration;
         }
 
@@ -273,7 +284,10 @@ namespace Raven.Server.Documents.Revisions
             long? lastModifiedTicks,
             ref DocumentFlags documentFlags, out RevisionsCollectionConfiguration configuration)
         {
-            configuration = GetRevisionsConfiguration(collectionName.Name);
+            configuration = GetRevisionsConfiguration(collectionName.Name, documentFlags);
+
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication))
+                return false;
 
             if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.SkipRevisionCreation))
                 return false;
@@ -351,7 +365,7 @@ namespace Raven.Server.Documents.Revisions
             return true;
         }
 
-        public bool ShouldVersionOldDocument(DocumentsOperationContext context, DocumentFlags flags, BlittableJsonReaderObject oldDoc, string changeVector, CollectionName collectionName = null)
+        public bool ShouldVersionOldDocument(DocumentsOperationContext context, DocumentFlags flags, BlittableJsonReaderObject oldDoc, string changeVector, CollectionName collectionName)
         {
             if (oldDoc == null)
                 return false; // no document to version
@@ -396,10 +410,12 @@ namespace Raven.Server.Documents.Revisions
             if (collectionName == null)
                 collectionName = _database.DocumentsStorage.ExtractCollectionName(context, document);
             if (configuration == null)
-                configuration = GetRevisionsConfiguration(collectionName.Name);
+                configuration = GetRevisionsConfiguration(collectionName.Name, flags);
 
             if (configuration.Disabled &&
-                nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false)
+                nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false &&
+                nonPersistentFlags.Contain(NonPersistentDocumentFlags.ForceRevisionCreation) == false &&
+                nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromSmuggler) == false)
                 return false;
 
             using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(context, id, out Slice lowerId, out Slice idSlice))
@@ -494,6 +510,7 @@ namespace Raven.Server.Documents.Revisions
                 {
                     var name = timeSeriesNames[i].ToString();
                     var (count, start, end) = _documentsStorage.TimeSeriesStorage.Stats.GetStats(context, id, name);
+                    Debug.Assert(start == default || start.Kind == DateTimeKind.Utc);
 
                     dvj[name] = new DynamicJsonValue
                     {
@@ -629,7 +646,10 @@ namespace Raven.Server.Documents.Revisions
             RevisionsCollectionConfiguration configuration, long revisionsCount, NonPersistentDocumentFlags nonPersistentFlags, string changeVector, long lastModifiedTicks)
         {
             var moreRevisionToDelete = false;
-            if ((nonPersistentFlags & NonPersistentDocumentFlags.FromSmuggler) == NonPersistentDocumentFlags.FromSmuggler)
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromSmuggler))
+                return false;
+
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication))
                 return false;
 
             if (configuration.MinimumRevisionsToKeep.HasValue == false &&
@@ -1399,7 +1419,7 @@ namespace Raven.Server.Documents.Revisions
                 return _ids.Count;
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 return new EnforceRevisionConfigurationCommandDto(_revisionsStorage, _ids);
             }
@@ -1639,7 +1659,7 @@ namespace Raven.Server.Documents.Revisions
                 return collectionName;
             }
 
-            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 return new RevertDocumentsCommandDto(_list);
             }
@@ -1766,41 +1786,32 @@ namespace Raven.Server.Documents.Revisions
 
             foreach (var tvr in table.SeekForwardFrom(RevisionsSchema.FixedSizeIndexes[AllRevisionsEtagsSlice], etag, 0))
             {
-                var document = TableValueToRevision(context, ref tvr.Reader);
-                yield return document;
-
                 if (take-- <= 0)
                     yield break;
+
+                var document = TableValueToRevision(context, ref tvr.Reader);
+                yield return document;
             }
         }
 
-        public IEnumerable<(Document previous, Document current)> GetRevisionsFrom(DocumentsOperationContext context, long etag, long start, long take)
+        public IEnumerable<Document> GetRevisionsFrom(DocumentsOperationContext context, string collection, long etag, long take)
         {
-            var table = new Table(RevisionsSchema, context.Transaction.InnerTransaction);
+            var collectionName = _documentsStorage.GetCollection(collection, throwIfDoesNotExist: false);
+            if (collectionName == null)
+                yield break;
 
-            var iterator = table?.SeekForwardFrom(RevisionsSchema.FixedSizeIndexes[AllRevisionsEtagsSlice], etag, start);
+            var tableName = collectionName.GetTableName(CollectionTableType.Revisions);
+            var table = context.Transaction.InnerTransaction.OpenTable(RevisionsSchema, tableName);
+            if (table == null)
+                yield break;
 
-            return GetCurrentAndPreviousRevisionsFrom(context, iterator, table, take);
-        }
-
-        public IEnumerable<Document> GetRevisionsFrom(DocumentsOperationContext context, List<string> collections, long etag, long take)
-        {
-            foreach (var collection in collections)
+            foreach (var tvr in table.SeekForwardFrom(RevisionsSchema.FixedSizeIndexes[CollectionRevisionsEtagsSlice], etag, 0))
             {
-                if (take <= 0)
+                if (take-- <= 0)
                     yield break;
 
-                var collectionName = _documentsStorage.GetCollection(collection, throwIfDoesNotExist: false);
-                if (collectionName == null)
-                    continue;
-
-                foreach (var document in GetRevisionsFrom(context, collectionName, etag, long.MaxValue))
-                {
-                    if (take-- <= 0)
-                        yield break;
-
-                    yield return document.Current;
-                }
+                var document = TableValueToRevision(context, ref tvr.Reader);
+                yield return document;
             }
         }
 
@@ -1832,7 +1843,24 @@ namespace Raven.Server.Documents.Revisions
             return true;
         }
 
-        public IEnumerable<(Document Previous, Document Current)> GetRevisionsFrom(DocumentsOperationContext context, CollectionName collectionName, long etag, long take)
+        public IEnumerable<(Document Previous, Document Current)> GetCurrentAndPreviousRevisionsForSubscriptionsFrom(
+            DocumentsOperationContext context,
+            long etag,
+            long start,
+            long take)
+        {
+            var table = new Table(RevisionsSchema, context.Transaction.InnerTransaction);
+
+            var iterator = table.SeekForwardFrom(RevisionsSchema.FixedSizeIndexes[AllRevisionsEtagsSlice], etag, start);
+
+            return GetCurrentAndPreviousRevisionsFrom(context, iterator, table, take);
+        }
+
+        public IEnumerable<(Document Previous, Document Current)> GetCurrentAndPreviousRevisionsForSubscriptionsFrom(
+            DocumentsOperationContext context,
+            CollectionName collectionName,
+            long etag,
+            long take)
         {
             var tableName = collectionName.GetTableName(CollectionTableType.Revisions);
             var table = context.Transaction.InnerTransaction.OpenTable(RevisionsSchema, tableName);
@@ -1842,7 +1870,11 @@ namespace Raven.Server.Documents.Revisions
             return GetCurrentAndPreviousRevisionsFrom(context, iterator, table, take);
         }
 
-        private IEnumerable<(Document Previous, Document Current)> GetCurrentAndPreviousRevisionsFrom(DocumentsOperationContext context, IEnumerable<Table.TableValueHolder> iterator, Table table, long take)
+        private static IEnumerable<(Document Previous, Document Current)> GetCurrentAndPreviousRevisionsFrom(
+            DocumentsOperationContext context,
+            IEnumerable<Table.TableValueHolder> iterator,
+            Table table,
+            long take)
         {
             if (table == null)
                 yield break;

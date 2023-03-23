@@ -853,7 +853,7 @@ namespace Raven.Client.Documents.Indexes
             StringExtensions.EscapeString(_out, value);
         }
 
-        
+
 
         private void OutLiteral(char c)
         {
@@ -1007,27 +1007,32 @@ namespace Raven.Client.Documents.Indexes
             return type.FullName;
         }
 
-        private bool TypeExistsOnServer(Type type)
+        private bool TypeExistsOnServer(Type type) => TypeExistsOnServer(type, false);
+
+        private bool TypeExistsOnServer(Type type, bool isGenericArgument)
         {
             if (_insideWellKnownType)
                 return true;
-            
+
             if (type.IsGenericType)
             {
                 foreach (Type genericArgument in type.GetGenericArguments())
                 {
-                    if (TypeExistsOnServer(genericArgument) == false)
+                    if (TypeExistsOnServer(genericArgument, true) == false)
                         return false;
                 }
             }
+
+            if (type.IsEnum && isGenericArgument) // enum is known type when it is a generic argument
+                return true;
+
+            if (type.Assembly == typeof(HashSet<>).Assembly) // System.Core
+                return true;
 
             if (type.Assembly == typeof(object).Assembly) // mscorlib
                 return true;
 
             if (type.Assembly == typeof(Uri).Assembly) // System assembly
-                return true;
-
-            if (type.Assembly == typeof(HashSet<>).Assembly) // System.Core
                 return true;
 
             if (type.Assembly == typeof(Regex).Assembly) // System.Text.RegularExpressions
@@ -1886,6 +1891,7 @@ namespace Raven.Client.Documents.Indexes
                     case "Union":
                     case "Concat":
                     case "Intersect":
+                    case nameof(Enumerable.Distinct):
                         return true;
                     case nameof(Enumerable.OrderBy):
                     case nameof(Enumerable.OrderByDescending):

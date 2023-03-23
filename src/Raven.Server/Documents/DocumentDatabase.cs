@@ -17,6 +17,7 @@ using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
+using Raven.Server.Config.Settings;
 using Raven.Server.Documents.ETL;
 using Raven.Server.Documents.Expiration;
 using Raven.Server.Documents.Handlers;
@@ -48,9 +49,7 @@ using Sparrow.Json.Sync;
 using Sparrow.Logging;
 using Sparrow.Platform;
 using Sparrow.Server;
-using Sparrow.Server.Json.Sync;
 using Sparrow.Server.Meters;
-using Sparrow.Server.Utils;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron;
@@ -76,6 +75,8 @@ namespace Raven.Server.Documents
         private readonly object _idleLocker = new object();
 
         private readonly object _clusterLocker = new object();
+
+        public Action<string> AddToInitLog => _addToInitLog;
 
         /// <summary>
         /// The current lock, used to make sure indexes have a unique names
@@ -361,7 +362,7 @@ namespace Raven.Server.Documents
                     }
                 }, null);
 
-                Task.Run(async () =>
+                _clusterTransactionsTask = Task.Run(async () =>
                 {
                     try
                     {
@@ -430,8 +431,23 @@ namespace Raven.Server.Documents
         public long LastCompletedClusterTransaction => _lastCompletedClusterTransaction;
         public bool IsEncrypted => MasterKey != null;
 
+        private Task _clusterTransactionsTask;
         private int _clusterTransactionDelayOnFailure = 1000;
         private FileLocker _fileLocker;
+
+        private static readonly List<StorageEnvironmentWithType.StorageEnvironmentType> DefaultStorageEnvironmentTypes = new()
+        {
+            StorageEnvironmentWithType.StorageEnvironmentType.Documents,
+            StorageEnvironmentWithType.StorageEnvironmentType.Configuration,
+            StorageEnvironmentWithType.StorageEnvironmentType.Index
+        };
+
+        private static readonly List<StorageEnvironmentWithType.StorageEnvironmentType> DefaultStorageEnvironmentTypesForBackup = new()
+        {
+            StorageEnvironmentWithType.StorageEnvironmentType.Index,
+            StorageEnvironmentWithType.StorageEnvironmentType.Documents,
+            StorageEnvironmentWithType.StorageEnvironmentType.Configuration,
+        };
 
         private async Task ExecuteClusterTransactionTask()
         {
@@ -455,7 +471,13 @@ namespace Raven.Server.Documents
                     using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                     using (context.OpenReadTransaction())
                     {
-                        await ExecuteClusterTransaction(context);
+                        const int batchSize = 256;
+                        var executed = await ExecuteClusterTransaction(context, batchSize: batchSize);
+                        if (executed.Count == batchSize)
+                        {
+                            // we might have more to execute
+                            _hasClusterTransaction.Set();
+                        }
                     }
                 }
                 catch (Exception e)
@@ -468,34 +490,66 @@ namespace Raven.Server.Documents
             }
         }
 
-        public async Task ExecuteClusterTransaction(TransactionOperationContext context)
+        public async Task<List<ClusterTransactionCommand.SingleClusterDatabaseCommand>> ExecuteClusterTransaction(TransactionOperationContext context, int batchSize)
         {
             var batch = new List<ClusterTransactionCommand.SingleClusterDatabaseCommand>(
-                ClusterTransactionCommand.ReadCommandsBatch(context, Name, fromCount: _nextClusterCommand, take: 256));
+                ClusterTransactionCommand.ReadCommandsBatch(context, Name, fromCount: _nextClusterCommand, take: batchSize));
 
             if (batch.Count == 0)
-                return;
+            {
+                var index = _serverStore.Cluster.GetLastCompareExchangeIndexForDatabase(context, Name);
+                
+                if (RachisLogIndexNotifications.LastModifiedIndex != index)
+                    RachisLogIndexNotifications.NotifyListenersAbout(index, null);
+
+                return batch;
+            }
 
             var mergedCommands = new BatchHandler.ClusterTransactionMergedCommand(this, batch);
+
+            ForTestingPurposes?.BeforeExecutingClusterTransactions?.Invoke();
+
             try
             {
-                //If we get a database shutdown while we process a cluster tx command this
-                //will cause us to stop running and disposing the context while its memory is still been used by the merger execution
-                await TxMerger.Enqueue(mergedCommands);
-            }
-            catch (Exception e)
-            {
-                if (_logger.IsInfoEnabled)
+                try
                 {
-                    _logger.Info($"Failed to execute cluster transaction batch (count: {batch.Count}), will retry them one-by-one.", e);
+                    //If we get a database shutdown while we process a cluster tx command this
+                    //will cause us to stop running and disposing the context while its memory is still been used by the merger execution
+                    await TxMerger.Enqueue(mergedCommands);
                 }
-                await ExecuteClusterTransactionOneByOne(batch);
-                return;
+                catch (Exception e) when (_databaseShutdown.IsCancellationRequested == false)
+                {
+                    if (_logger.IsInfoEnabled)
+                    {
+                        _logger.Info($"Failed to execute cluster transaction batch (count: {batch.Count}), will retry them one-by-one.", e);
+                    }
+                    await ExecuteClusterTransactionOneByOne(batch);
+                    return batch;
+                }
+
+                foreach (var command in batch)
+                {
+                    OnClusterTransactionCompletion(command, mergedCommands);
+                }
             }
-            foreach (var command in batch)
+            catch
             {
-                OnClusterTransactionCompletion(command, mergedCommands);
+                if (_databaseShutdown.IsCancellationRequested == false)
+                    throw;
+
+                // we got an exception while the database was shutting down
+                // setting it only for commands that we didn't process yet (can only be if we used ExecuteClusterTransactionOneByOne)
+                var exception = CreateDatabaseShutdownException();
+                foreach (var command in batch)
+                {
+                    if (command.Processed)
+                        continue;
+
+                    ClusterTransactionWaiter.SetException(command.Options.TaskId, command.Index, exception);
+                }
             }
+
+            return batch;
         }
 
         private async Task ExecuteClusterTransactionOneByOne(List<ClusterTransactionCommand.SingleClusterDatabaseCommand> batch)
@@ -513,8 +567,9 @@ namespace Raven.Server.Documents
                     OnClusterTransactionCompletion(command, mergedCommand);
 
                     _clusterTransactionDelayOnFailure = 1000;
+                    command.Processed = true;
                 }
-                catch (Exception e)
+                catch (Exception e) when (_databaseShutdown.IsCancellationRequested == false)
                 {
                     OnClusterTransactionCompletion(command, mergedCommand, exception: e);
                     NotificationCenter.Add(AlertRaised.Create(
@@ -550,7 +605,7 @@ namespace Raven.Server.Documents
                     {
                         indexTask = BatchHandler.WaitForIndexesAsync(DocumentsStorage.ContextPool, this, options.WaitForIndexesTimeout.Value,
                             options.SpecifiedIndexesQueryString, options.WaitForIndexThrow,
-                            mergedCommands.LastChangeVector, mergedCommands.LastTombstoneEtag, mergedCommands.ModifiedCollections);
+                            mergedCommands.LastDocumentEtag, mergedCommands.LastTombstoneEtag, mergedCommands.ModifiedCollections);
                     }
 
                     var result = new BatchHandler.ClusterTransactionCompletionResult
@@ -697,6 +752,8 @@ namespace Raven.Server.Documents
             });
             ForTestingPurposes?.DisposeLog?.Invoke(Name, "Disposed TxMerger");
 
+            ForTestingPurposes?.AfterTxMergerDispose?.Invoke();
+
             // must acquire the lock in order to prevent concurrent access to index files
             if (lockTaken == false)
             {
@@ -805,6 +862,17 @@ namespace Raven.Server.Documents
                 DocumentsStorage?.Dispose();
             });
             ForTestingPurposes?.DisposeLog?.Invoke(Name, "Disposed DocumentsStorage");
+
+            var clusterTransactionsTask = _clusterTransactionsTask;
+            if (clusterTransactionsTask != null)
+            {
+                ForTestingPurposes?.DisposeLog?.Invoke(Name, "Waiting for cluster transactions executor task to complete");
+                exceptionAggregator.Execute(() =>
+                {
+                    clusterTransactionsTask.Wait();
+                });
+                ForTestingPurposes?.DisposeLog?.Invoke(Name, "Finished waiting for cluster transactions executor task to complete");
+            }
 
             ForTestingPurposes?.DisposeLog?.Invoke(Name, "Disposing _databaseShutdown");
             exceptionAggregator.Execute(() =>
@@ -1004,50 +1072,73 @@ namespace Raven.Server.Documents
             }
         }
 
-        public IEnumerable<StorageEnvironmentWithType> GetAllStoragesEnvironment()
+        public IEnumerable<StorageEnvironmentWithType> GetAllStoragesEnvironment(List<StorageEnvironmentWithType.StorageEnvironmentType> types = null)
         {
-            // TODO :: more storage environments ?
-            var documentsStorage = DocumentsStorage;
-            if (documentsStorage != null)
-                yield return
-                    new StorageEnvironmentWithType(Name, StorageEnvironmentWithType.StorageEnvironmentType.Documents,
-                        documentsStorage.Environment);
-            var configurationStorage = ConfigurationStorage;
-            if (configurationStorage != null)
-                yield return
-                    new StorageEnvironmentWithType("Configuration",
-                        StorageEnvironmentWithType.StorageEnvironmentType.Configuration, configurationStorage.Environment);
+            types ??= DefaultStorageEnvironmentTypes;
 
-            //check for null to prevent NRE when disposing the DocumentDatabase
-            foreach (var index in (IndexStore?.GetIndexes()).EmptyIfNull())
+            // TODO :: more storage environments ?
+            foreach (var type in types)
             {
-                var env = index?._indexStorage?.Environment();
-                if (env != null)
-                    yield return
-                        new StorageEnvironmentWithType(index.Name,
-                            StorageEnvironmentWithType.StorageEnvironmentType.Index, env)
+                switch (type)
+                {
+                    case StorageEnvironmentWithType.StorageEnvironmentType.Documents:
+                        var documentsStorage = DocumentsStorage;
+                        if (documentsStorage != null)
+                            yield return
+                                new StorageEnvironmentWithType(Name, StorageEnvironmentWithType.StorageEnvironmentType.Documents,
+                                    documentsStorage.Environment);
+                        break;
+                    
+                    case StorageEnvironmentWithType.StorageEnvironmentType.Configuration:
+                        var configurationStorage = ConfigurationStorage;
+                        if (configurationStorage != null)
+                            yield return
+                                new StorageEnvironmentWithType("Configuration",
+                                    StorageEnvironmentWithType.StorageEnvironmentType.Configuration, configurationStorage.Environment);
+                        break;
+
+                    case StorageEnvironmentWithType.StorageEnvironmentType.Index:
+                        //check for null to prevent NRE when disposing the DocumentDatabase
+                        foreach (var index in (IndexStore?.GetIndexes()).EmptyIfNull())
                         {
-                            LastIndexQueryTime = index.GetLastQueryingTime()
-                        };
+                            var env = index?._indexStorage?.Environment();
+                            if (env != null)
+                                yield return
+                                    new StorageEnvironmentWithType(index.Name,
+                                        StorageEnvironmentWithType.StorageEnvironmentType.Index, env)
+                                    {
+                                        LastIndexQueryTime = index.GetLastQueryingTime()
+                                    };
+                        }
+                        break;
+                }
             }
         }
 
-        private IEnumerable<FullBackup.StorageEnvironmentInformation> GetAllStoragesForBackup()
+        private IEnumerable<FullBackup.StorageEnvironmentInformation> GetAllStoragesForBackup(bool excludeIndexes)
         {
-            foreach (var storageEnvironmentWithType in GetAllStoragesEnvironment())
+            foreach (var storageEnvironmentWithType in GetAllStoragesEnvironment(DefaultStorageEnvironmentTypesForBackup))
             {
                 switch (storageEnvironmentWithType.Type)
                 {
                     case StorageEnvironmentWithType.StorageEnvironmentType.Documents:
+                        ForTestingPurposes?.BeforeSnapshotOfDocuments?.Invoke();
+
                         yield return new FullBackup.StorageEnvironmentInformation
                         {
                             Name = string.Empty,
                             Folder = Constants.Documents.PeriodicBackup.Folders.Documents,
                             Env = storageEnvironmentWithType.Environment
                         };
+
+                        ForTestingPurposes?.AfterSnapshotOfDocuments?.Invoke();
+
                         break;
 
                     case StorageEnvironmentWithType.StorageEnvironmentType.Index:
+                        if (excludeIndexes)
+                            break;
+
                         yield return new FullBackup.StorageEnvironmentInformation
                         {
                             Name = IndexDefinitionBaseServerSide.GetIndexNameSafeForFileSystem(storageEnvironmentWithType.Name),
@@ -1072,10 +1163,18 @@ namespace Raven.Server.Documents
         }
 
         public SmugglerResult FullBackupTo(string backupPath, CompressionLevel compressionLevel = CompressionLevel.Optimal,
-            Action<(string Message, int FilesCount)> infoNotify = null, CancellationToken cancellationToken = default)
+            bool excludeIndexes = false, Action<(string Message, int FilesCount)> infoNotify = null, CancellationToken cancellationToken = default)
         {
             SmugglerResult smugglerResult;
 
+            long lastTombstoneEtag = 0;
+            using (DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext ctx))
+            using (ctx.OpenReadTransaction())
+            {
+                lastTombstoneEtag = DocumentsStorage.ReadLastTombstoneEtag(ctx.Transaction.InnerTransaction);
+            }
+
+            using (TombstoneCleaner.PreventTombstoneCleaningUpToEtag(lastTombstoneEtag))
             using (var file = SafeFileStream.Create(backupPath, FileMode.Create))
             using (var package = new ZipArchive(file, ZipArchiveMode.Create, leaveOpen: true))
             {
@@ -1160,7 +1259,7 @@ namespace Raven.Server.Documents
 
                 infoNotify?.Invoke(("Backed up database values", 1));
 
-                BackupMethods.Full.ToFile(GetAllStoragesForBackup(), package, compressionLevel,
+                BackupMethods.Full.ToFile(GetAllStoragesForBackup(excludeIndexes), package, compressionLevel,
                     infoNotify: infoNotify, cancellationToken: cancellationToken);
 
                 file.Flush(true); // make sure that we fully flushed to disk
@@ -1608,9 +1707,14 @@ namespace Raven.Server.Documents
 
         internal void HandleNonDurableFileSystemError(object sender, NonDurabilitySupportEventArgs e)
         {
+            string title = $"Non Durable File System - {Name ?? "Unknown Database"}";
+
+            if (_logger.IsOperationsEnabled)
+                _logger.Operations($"{title}. {e.Message}", e.Exception);
+
             _serverStore?.NotificationCenter.Add(AlertRaised.Create(
                 Name,
-                $"Non Durable File System - {Name ?? "Unknown Database"}",
+                title,
                 e.Message,
                 AlertType.NonDurableFileSystem,
                 NotificationSeverity.Warning,
@@ -1658,12 +1762,17 @@ namespace Raven.Server.Documents
                     throw new ArgumentOutOfRangeException(nameof(type), type.ToString());
             }
 
+            string message = $"{e.Message}{Environment.NewLine}{Environment.NewLine}Environment: {environment}";
+
+            if (_logger.IsOperationsEnabled)
+                _logger.Operations($"{title}. {message}", e.Exception);
+
             nc?.Add(AlertRaised.Create(Name,
                 title,
-                $"{e.Message}{Environment.NewLine}{Environment.NewLine}Environment: {environment}",
+                message,
                 AlertType.RecoveryError,
                 NotificationSeverity.Error,
-                key: resourceName));
+                key: $"{resourceName}/{SystemTime.UtcNow.Ticks % 5}")); // if this was called multiple times let's try to not overwrite previous alerts
         }
 
         internal void HandleOnDatabaseIntegrityErrorOfAlreadySyncedData(object sender, DataIntegrityErrorEventArgs e)
@@ -1706,18 +1815,26 @@ namespace Raven.Server.Documents
                     throw new ArgumentOutOfRangeException(nameof(type), type.ToString());
             }
 
+            string message = $"{e.Message}{Environment.NewLine}{Environment.NewLine}Environment: {environment}";
+
+            if (_logger.IsOperationsEnabled)
+                _logger.Operations($"{title}. {message}", e.Exception);
+
             nc?.Add(AlertRaised.Create(Name,
                 title,
-                $"{e.Message}{Environment.NewLine}{Environment.NewLine}Environment: {environment}",
+                message,
                 AlertType.IntegrityErrorOfAlreadySyncedData,
                 NotificationSeverity.Warning,
-                key: resourceName));
+                key: $"{resourceName}/{SystemTime.UtcNow.Ticks % 5}")); // if this was called multiple times let's try to not overwrite previous alerts
         }
 
         internal void HandleRecoverableFailure(object sender, RecoverableFailureEventArgs e)
         {
             var title = $"Recoverable Voron error in '{Name}' database";
             var message = $"Failure {e.FailureMessage} in the following environment: {e.EnvironmentPath}";
+
+            if (_logger.IsOperationsEnabled)
+                _logger.Operations($"{title}. {message}", e.Exception);
 
             try
             {
@@ -1734,9 +1851,6 @@ namespace Raven.Server.Documents
             {
                 // exception in raising an alert can't prevent us from unloading a database
             }
-
-            if (_logger.IsOperationsEnabled)
-                _logger.Operations($"{title}. {message}", e.Exception);
         }
 
         public long GetEnvironmentsHash()
@@ -1771,11 +1885,23 @@ namespace Raven.Server.Documents
 
             internal Action CollectionRunnerBeforeOpenReadTransaction;
 
+            internal Action CompactionAfterDatabaseUnload;
+
+            internal Action AfterTxMergerDispose;
+
+            internal Action BeforeExecutingClusterTransactions;
+
+            internal Action BeforeSnapshotOfDocuments;
+
+            internal Action AfterSnapshotOfDocuments;
+
             internal bool SkipDrainAllRequests = false;
 
             internal Action<string, string> DisposeLog;
 
             internal bool ForceSendTombstones = false;
+
+            internal Action<PathSetting> ActionToCallOnGetTempPath;
 
             internal IDisposable CallDuringDocumentDatabaseInternalDispose(Action action)
             {

@@ -681,18 +681,18 @@ namespace Voron.Data.BTrees
             return SearchForPage(key, allowCompressed, out cursor, out node);
         }
         [ThreadStatic]
-        private FastList<long> _cursorPathBuffer;
+        private static FastList<long> CursorPathBuffer;
 
         private TreePage SearchForPage(Slice key, out TreeNodeHeader* node)
         {
             var p = GetReadOnlyTreePage(State.RootPageNumber);
 
-            if (_cursorPathBuffer == null)
-                _cursorPathBuffer = new FastList<long>();
+            if (CursorPathBuffer == null)
+                CursorPathBuffer = new FastList<long>();
             else
-                _cursorPathBuffer.Clear();
+                CursorPathBuffer.Clear();
 
-            _cursorPathBuffer.Add(p.PageNumber);
+            CursorPathBuffer.Add(p.PageNumber);
 
             bool rightmostPage = true;
             bool leftmostPage = true;
@@ -721,7 +721,7 @@ namespace Voron.Data.BTrees
                 Debug.Assert(pageNode->PageNumber == p.PageNumber,
                     string.Format("Requested Page: #{0}. Got Page: #{1}", pageNode->PageNumber, p.PageNumber));
 
-                _cursorPathBuffer.Add(p.PageNumber);
+                CursorPathBuffer.Add(p.PageNumber);
             }
 
             if (p.IsLeaf == false)
@@ -732,7 +732,7 @@ namespace Voron.Data.BTrees
 
             node = p.Search(_llt, key); // will set the LastSearchPosition
 
-            AddToRecentlyFoundPages(_cursorPathBuffer, p, leftmostPage, rightmostPage);
+            AddToRecentlyFoundPages(CursorPathBuffer, p, leftmostPage, rightmostPage);
 
             return p;
         }
@@ -1261,10 +1261,20 @@ namespace Voron.Data.BTrees
 
                             using (p.GetNodeKey(_llt, i, out Slice fixedSizeTreeName))
                             {
-                                var fixedSizeTree = new FixedSizeTree(_llt, this, fixedSizeTreeName, valueSize);
+                                FixedSizeTree fixedSizeTree;
 
-                                var pages = fixedSizeTree.AllPages();
-                                results.AddRange(pages);
+                                try
+                                {
+                                    fixedSizeTree = new FixedSizeTree(_llt, this, fixedSizeTreeName, valueSize);
+
+                                    var pages = fixedSizeTree.AllPages();
+                                    results.AddRange(pages);
+                                }
+                                catch (InvalidFixedSizeTree)
+                                {
+                                    // ignored - we sometimes have trees with mixed types of values - regular values reside next to fixed size tree headers
+                                    continue;
+                                }
 
                                 if ((State.Flags & TreeFlags.Streams) == TreeFlags.Streams)
                                 {

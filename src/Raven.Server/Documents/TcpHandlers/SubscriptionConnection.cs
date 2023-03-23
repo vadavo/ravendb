@@ -15,6 +15,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Esprima;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Exceptions;
@@ -408,7 +409,7 @@ namespace Raven.Server.Documents.TcpHandlers
         {
             var errorMessage = $"Failed to process subscription {SubscriptionId} / from client {TcpConnection.TcpClient.Client.RemoteEndPoint}";
             AddToStatusDescription($"{errorMessage}. Sending response to client");
-            if (_logger.IsInfoEnabled)
+            if (_logger.IsInfoEnabled && e is not OperationCanceledException)
             {
                 _logger.Info(errorMessage, e);
             }
@@ -516,7 +517,7 @@ namespace Raven.Server.Documents.TcpHandlers
                                     // check that the subscription exists on AppropriateNode
                                     var clusterTopology = server.GetClusterTopology(ctx);
                                     using (var requester = ClusterRequestExecutor.CreateForSingleNode(
-                                        clusterTopology.GetUrlFromTag(subscriptionDoesNotBelongException.AppropriateNode), server.Server.Certificate.Certificate))
+                                    clusterTopology.GetUrlFromTag(subscriptionDoesNotBelongException.AppropriateNode), server.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
                                     {
                                         await requester.ExecuteAsync(new WaitForRaftIndexCommand(subscriptionDoesNotBelongException.Index), ctx);
                                     }
@@ -582,13 +583,15 @@ namespace Raven.Server.Documents.TcpHandlers
                         await ReportExceptionToClient(server, connection, commandExecution.InnerException, recursionDepth - 1);
                         break;
                     default:
-                        connection.AddToStatusDescription("Subscription error");
-
-                        if (connection._logger.IsInfoEnabled)
+                        if (ex is not OperationCanceledException)
                         {
-                            connection._logger.Info("Subscription error", ex);
-                        }
+                            connection.AddToStatusDescription("Subscription error");
 
+                            if (connection._logger.IsInfoEnabled)
+                            {
+                                connection._logger.Info("Subscription error", ex);
+                            }
+                        }
                         await connection.WriteJsonAsync(new DynamicJsonValue
                         {
                             [nameof(SubscriptionConnectionServerMessage.Type)] = nameof(SubscriptionConnectionServerMessage.MessageType.Error),
@@ -1079,7 +1082,7 @@ namespace Raven.Server.Documents.TcpHandlers
             }
             catch (Exception ex)
             {
-                throw new SubscriptionClosedException($"Cannot contact client anymore, closing subscription ({Options?.SubscriptionName})", ex);
+                throw new SubscriptionClosedException($"Cannot contact client anymore, closing subscription ({Options?.SubscriptionName})", canReconnect: ex is OperationCanceledException, ex);
             }
 
             TcpConnection.RegisterBytesSent(Heartbeat.Length);
@@ -1113,7 +1116,7 @@ namespace Raven.Server.Documents.TcpHandlers
 
                 var resultingTask = await Task
                     .WhenAny(hasMoreDocsTask, pendingReply, TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(WaitForChangedDocumentsTimeoutInMs))).ConfigureAwait(false);
-              
+
                 TcpConnection.DocumentDatabase.ForTestingPurposes?.Subscription_ActionToCallDuringWaitForChangedDocuments?.Invoke();
 
                 if (CancellationTokenSource.IsCancellationRequested)

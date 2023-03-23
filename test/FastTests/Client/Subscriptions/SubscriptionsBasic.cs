@@ -570,11 +570,13 @@ namespace FastTests.Client.Subscriptions
             SubscriptionWorker<dynamic> throwingSubscriptionWorker = null;
             SubscriptionWorker<dynamic> notThrowingSubscriptionWorker = null;
 
+            DoNotReuseServer();
             var store = GetDocumentStore();
             try
             {
-                Server.ServerStore.Observer.Suspended = true;
-                var id = store.Subscriptions.Create(new SubscriptionCreationOptions<User>());
+                Cluster.SuspendObserver(Server);
+
+                var id = await store.Subscriptions.CreateAsync(new SubscriptionCreationOptions<User>());
                 subscriptionWorker = store.Subscriptions.GetSubscriptionWorker(new SubscriptionWorkerOptions(id)
                 {
                     Strategy = SubscriptionOpeningStrategy.OpenIfFree,
@@ -596,12 +598,9 @@ namespace FastTests.Client.Subscriptions
                 });
                 var subscriptionTask = throwingSubscriptionWorker.Run(x => { });
 
-                Assert.True(await Assert.ThrowsAsync<SubscriptionInUseException>(() =>
-                {
-                    return subscriptionTask;
-                }).WaitWithoutExceptionAsync(_reasonableWaitTime));
+                Assert.True(await Assert.ThrowsAsync<SubscriptionInUseException>(() => subscriptionTask).WaitWithoutExceptionAsync(_reasonableWaitTime));
 
-                store.Subscriptions.DropConnection(id);
+                await store.Subscriptions.DropConnectionAsync(id);
 
                 notThrowingSubscriptionWorker = store.Subscriptions.GetSubscriptionWorker(new SubscriptionWorkerOptions(id)
                 {
@@ -721,10 +720,12 @@ namespace FastTests.Client.Subscriptions
         [Fact]
         public async Task RavenDB_3452_ShouldStopPullingDocsIfReleased()
         {
+            DoNotReuseServer();
             using (var store = GetDocumentStore())
             {
-                Server.ServerStore.Observer.Suspended = true;
-                var id = store.Subscriptions.Create(new SubscriptionCreationOptions<User>());
+                Cluster.SuspendObserver(Server);
+
+                var id = await store.Subscriptions.CreateAsync(new SubscriptionCreationOptions<User>());
 
                 using (var subscription = store.Subscriptions.GetSubscriptionWorker(new SubscriptionWorkerOptions(id)
                 {
@@ -744,7 +745,7 @@ namespace FastTests.Client.Subscriptions
 
                     Assert.True(docs.TryTake(out _, _reasonableWaitTime));
                     Assert.True(docs.TryTake(out _, _reasonableWaitTime));
-                    store.Subscriptions.DropConnection(id);
+                    await store.Subscriptions.DropConnectionAsync(id);
 
                     try
                     {

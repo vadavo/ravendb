@@ -60,7 +60,7 @@ namespace RachisTests
 
             await ActionWithLeader((l) => l.ServerStore.RemoveFromClusterAsync(watcher.ServerStore.NodeTag));
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
             {
                 await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(watcher.WebUrl, watcher.ServerStore.NodeTag), ctx);
@@ -218,7 +218,7 @@ namespace RachisTests
             var dest = raft2.ServerStore.GetNodeHttpServerUrl();
 
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -248,7 +248,7 @@ namespace RachisTests
             var dest = raft2.ServerStore.GetNodeHttpServerUrl();
 
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -279,7 +279,7 @@ namespace RachisTests
 
             // here we pusblish a wrong PublicServerUrl, but connect to the ServerUrl, so the HTTP connection should be okay, but will when trying to the TCP connection.
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -309,7 +309,7 @@ namespace RachisTests
             var dest = raft2.ServerStore.GetNodeHttpServerUrl();
 
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -716,7 +716,7 @@ namespace RachisTests
             var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
             Servers.Add(server2);
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
             {
                 var ex = await Assert.ThrowsAsync<RavenException>(async () =>
@@ -754,7 +754,7 @@ namespace RachisTests
                 var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
                 Servers.Add(server2);
 
-                using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null))
+                using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
                 using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
                 {
                     await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(server2Url, watcher: true), ctx);
@@ -834,7 +834,7 @@ namespace RachisTests
             var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
             Servers.Add(server2);
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
             {
                 await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(server2Url, watcher: true), ctx);
@@ -843,7 +843,7 @@ namespace RachisTests
 
             using (server2.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
             {
-                var logs = ctx.ReadObject(server2.ServerStore.Engine.InMemoryDebug.ToJson(),"watcher-logs").ToString();
+                var logs = ctx.ReadObject(server2.ServerStore.Engine.InMemoryDebug.ToJson(), "watcher-logs").ToString();
                 Assert.False(logs.Contains("Exception"), logs);
             }
         }
@@ -879,7 +879,7 @@ namespace RachisTests
             Assert.Equal(3, topology.AllNodes.Count);
         }
 
-        private async Task WaitForAssertionAsync(Func<Task> action)
+        private static async Task WaitForAssertionAsync(Func<Task> action, int timeoutInMs = 15_000)
         {
             var sp = Stopwatch.StartNew();
             while (true)
@@ -891,7 +891,7 @@ namespace RachisTests
                 }
                 catch
                 {
-                    if (sp.ElapsedMilliseconds > 10_000)
+                    if (sp.ElapsedMilliseconds > timeoutInMs)
                         throw;
 
                     await Task.Delay(100);

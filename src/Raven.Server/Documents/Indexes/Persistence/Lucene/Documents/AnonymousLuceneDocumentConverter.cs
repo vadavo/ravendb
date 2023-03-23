@@ -40,7 +40,8 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
             _isMultiMap = isMultiMap;
         }
 
-        protected override int GetFields<T>(T instance, LazyStringValue key, LazyStringValue sourceDocumentId, object document, JsonOperationContext indexContext, IWriteOperationBuffer writeBuffer)
+        protected override int GetFields<T>(T instance, LazyStringValue key, LazyStringValue sourceDocumentId, object document, JsonOperationContext indexContext,
+            IWriteOperationBuffer writeBuffer, object sourceDocument)
         {
             int newFields = 0;
             if (key != null)
@@ -55,8 +56,18 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
                 newFields++;
             }
 
-            var boostedValue = document as BoostedValue;
-            var documentToProcess = boostedValue == null ? document : boostedValue.Value;
+            var boostedValue = document  as BoostedValue;
+            object documentToProcess;
+            if (boostedValue != null)
+            {
+                documentToProcess = boostedValue.Value;
+                Document.Boost = boostedValue.Boost;
+            }
+            else
+            {
+                documentToProcess = document;
+                Document.Boost = LuceneDefaultBoost;
+            }
 
             IPropertyAccessor accessor;
 
@@ -82,7 +93,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
                     throw new InvalidOperationException($"Field '{property.Key}' is not defined. Available fields: {string.Join(", ", _fields.Keys)}.", e);
                 }
 
-                var numberOfCreatedFields = GetRegularFields(instance, field, value, indexContext, out var shouldSkip);
+                var numberOfCreatedFields = GetRegularFields(instance, field, value, indexContext, sourceDocument, out var shouldSkip);
 
                 newFields += numberOfCreatedFields;
 
@@ -92,7 +103,6 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
                     for (int idx = fields.Count - 1; numberOfCreatedFields > 0; numberOfCreatedFields--, idx--)
                     {
                         var luceneField = fields[idx];
-                        luceneField.Boost = boostedValue.Boost;
                         luceneField.OmitNorms = false;
                     }
                 }

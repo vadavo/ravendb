@@ -19,12 +19,14 @@ import popoverUtils = require("common/popoverUtils");
 import prefixPathModel = require("models/database/tasks/prefixPathModel");
 import endpoints = require("endpoints");
 import getCertificatesCommand = require("commands/auth/getCertificatesCommand");
-import tasksCommonContent = require("models/database/tasks/tasksCommonContent");
+import accessManager = require("common/shell/accessManager");
 
 class editReplicationSinkTask extends viewModelBase {
 
     view = require("views/database/tasks/editReplicationSinkTask.html");
-    connectionStringView = require("views/database/settings/connectionStringRaven.html")
+    connectionStringView = require("views/database/settings/connectionStringRaven.html");
+    pinResponsibleNodeButtonsScriptView = require("views/partial/pinResponsibleNodeButtonsScript.html");
+    pinResponsibleNodeTextScriptView = require("views/partial/pinResponsibleNodeTextScript.html");
 
     editedSinkTask = ko.observable<ongoingTaskReplicationSinkEditModel>();
     isAddingNewTask = ko.observable<boolean>(true);
@@ -47,7 +49,7 @@ class editReplicationSinkTask extends viewModelBase {
     createNewConnectionString = ko.observable<boolean>(false);
     newConnectionString = ko.observable<connectionStringRavenEtlModel>();
 
-    canDefineCertificates = location.protocol === "https:";
+    canDefineCertificates = accessManager.default.secureServer();
     serverCertificateModel = ko.observable<replicationCertificateModel>();
     exportCertificateUrl = endpoints.global.adminCertificates.adminCertificatesExport;
     private readonly serverCertificateName = "Server Certificate";
@@ -71,7 +73,7 @@ class editReplicationSinkTask extends viewModelBase {
                             this.serverCertificateModel(new replicationCertificateModel(serverCertificate.Certificate));
                             deferred.resolve({can: true});
                         })
-                        .fail((response: JQueryXHR) => {
+                        .fail(() => {
                             deferred.resolve({ redirect: appUrl.forOngoingTasks(this.activeDatabase()) });
                         });
                 } else {
@@ -158,6 +160,7 @@ class editReplicationSinkTask extends viewModelBase {
                 model.taskName,
                 model.taskState,
                 model.manualChooseMentor,
+                model.pinMentorNode,
                 model.mentorNode,
                 model.connectionStringName,
                 this.createNewConnectionString,
@@ -236,11 +239,6 @@ class editReplicationSinkTask extends viewModelBase {
                     "<li><small>Only public keys are downloaded.</small></li>" +
                     "</ul>"
             });
-
-        popoverUtils.longWithHover($(".responsible-node"),
-            {
-                content: tasksCommonContent.responsibleNodeInfo
-            });
     }
 
     saveTask() {
@@ -280,7 +278,7 @@ class editReplicationSinkTask extends viewModelBase {
         this.spinners.save(true);
 
         // All is well, Save connection string (if relevant..) 
-        let savingNewStringAction = $.Deferred<void>();
+        const savingNewStringAction = $.Deferred<void>();
         if (this.createNewConnectionString()) {
             this.newConnectionString()
                 .saveConnectionString(this.activeDatabase())
@@ -351,14 +349,11 @@ class editReplicationSinkTask extends viewModelBase {
     
     private importConfigurationFile(contents: string) {
         try {
-            let hubName: string;
             let accessName: string;
             let certificate: replicationCertificateModel;
             let h2sPrefixes: Array<prefixPathModel>;
             let s2hPrefixes: Array<prefixPathModel>;
             let useSamePrefixes: boolean;
-            let h2sMode: boolean;
-            let s2hMode: boolean;
             
             const config = JSON.parse(contents) as pullReplicationExportFileFormat;
             
@@ -367,9 +362,9 @@ class editReplicationSinkTask extends viewModelBase {
                 return;
             }
 
-            hubName = config.HubName;
-            h2sMode = config.AllowHubToSinkMode;
-            s2hMode = config.AllowSinkToHubMode;
+            const hubName = config.HubName;
+            const h2sMode = config.AllowHubToSinkMode;
+            const s2hMode = config.AllowSinkToHubMode;
             
             if (this.canDefineCertificates) {
                 if (!config.AccessName || !config.HubToSinkPrefixes) {
@@ -437,7 +432,7 @@ class editReplicationSinkTask extends viewModelBase {
             this.editedSinkTask().replicationAccess().selectedFileName(shortFileName);
 
             const certAsBase64 = forge.util.encode64(data);
-            this.editedSinkTask().replicationAccess().onCertificateSelected(certAsBase64, shortFileName);
+            this.editedSinkTask().replicationAccess().onCertificateSelected(certAsBase64);
         });
     }
 

@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http.Features.Authentication;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Pkcs;
+using Raven.Client;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Exceptions.Security;
 using Raven.Client.Http;
@@ -16,6 +17,7 @@ using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations.Certificates;
 using Raven.Client.Util;
 using Raven.Server.Commercial;
+using Raven.Server.Commercial.LetsEncrypt;
 using Raven.Server.Config;
 using Raven.Server.Json;
 using Raven.Server.Routing;
@@ -110,7 +112,8 @@ namespace Raven.Server.Web.Authentication
                 SecurityClearance = certificate.SecurityClearance,
                 Thumbprint = selfSignedCertificate.Thumbprint,
                 PublicKeyPinningHash = selfSignedCertificate.GetPublicKeyPinningHash(),
-                NotAfter = selfSignedCertificate.NotAfter
+                NotAfter = selfSignedCertificate.NotAfter,
+                NotBefore = selfSignedCertificate.NotBefore
             };
 
             var res = await serverStore.PutValueInClusterAsync(new PutCertificateCommand(selfSignedCertificate.Thumbprint, newCertDef, raftRequestId));
@@ -130,73 +133,12 @@ namespace Raven.Server.Web.Authentication
                 await using (var s = entry.Open())
                     await s.WriteAsync(certBytes, 0, certBytes.Length);
 
-                await WriteCertificateAsPemAsync(certificate.Name, clientCertBytes, certificate.Password, archive);
+                await LetsEncryptCertificateUtil.WriteCertificateAsPemToZipArchiveAsync(certificate.Name, clientCertBytes, certificate.Password, archive);
             }
 
             return ms.ToArray();
         }
 
-        public static async Task WriteCertificateAsPemAsync(string name, byte[] rawBytes, string exportPassword, ZipArchive archive)
-        {
-            var a = new Pkcs12Store();
-            a.Load(new MemoryStream(rawBytes), Array.Empty<char>());
-
-            X509CertificateEntry entry = null;
-            AsymmetricKeyEntry key = null;
-            foreach (var alias in a.Aliases)
-            {
-                var aliasKey = a.GetKey(alias.ToString());
-                if (aliasKey != null)
-                {
-                    entry = a.GetCertificate(alias.ToString());
-                    key = aliasKey;
-                    break;
-                }
-            }
-
-            if (entry == null)
-            {
-                throw new InvalidOperationException("Could not find private key.");
-            }
-
-            var zipEntryCrt = archive.CreateEntry(name + ".crt");
-            zipEntryCrt.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
-
-            await using (var stream = zipEntryCrt.Open())
-            await using (var writer = new StreamWriter(stream))
-            {
-                var pw = new PemWriter(writer);
-                pw.WriteObject(entry.Certificate);
-            }
-
-            var zipEntryKey = archive.CreateEntry(name + ".key");
-            zipEntryKey.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
-
-            await using (var stream = zipEntryKey.Open())
-            await using (var writer = new StreamWriter(stream))
-            {
-                var pw = new PemWriter(writer);
-
-                object privateKey;
-                if (exportPassword != null)
-                {
-                    privateKey = new MiscPemGenerator(
-                            key.Key,
-                            "DES-EDE3-CBC",
-                            exportPassword.ToCharArray(),
-                            CertificateUtils.GetSeededSecureRandom())
-                        .Generate();
-                }
-                else
-                {
-                    privateKey = key.Key;
-                }
-
-                pw.WriteObject(privateKey);
-
-                await writer.FlushAsync();
-            }
-        }
 
         [RavenAction("/admin/certificates", "PUT", AuthorizationStatus.Operator)]
         public async Task Put()
@@ -237,7 +179,7 @@ namespace Raven.Server.Web.Authentication
                 try
                 {
                     var password = string.IsNullOrEmpty(certificate.Password) ? null : certificate.Password;
-                    using var certificate2 = new X509Certificate2(certBytes, password, X509KeyStorageFlags.MachineKeySet);
+                    using var certificate2 = CertificateLoaderUtil.CreateCertificate(certBytes, password);
                 }
                 catch (Exception e)
                 {
@@ -273,9 +215,9 @@ namespace Raven.Server.Web.Authentication
             var collection = new X509Certificate2Collection();
 
             if (string.IsNullOrEmpty(password))
-                collection.Import(certBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
+                CertificateLoaderUtil.Import(collection, certBytes);
             else
-                collection.Import(certBytes, password, X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+                CertificateLoaderUtil.Import(collection, certBytes, password, CertificateLoaderUtil.FlagsForPersist);
 
             var first = true;
             var collectionPrimaryKey = string.Empty;
@@ -318,6 +260,7 @@ namespace Raven.Server.Web.Authentication
                 currentCertDef.Thumbprint = x509Certificate.Thumbprint;
                 currentCertDef.PublicKeyPinningHash = x509Certificate.GetPublicKeyPinningHash();
                 currentCertDef.NotAfter = x509Certificate.NotAfter;
+                currentCertDef.NotBefore = x509Certificate.NotBefore;
                 currentCertDef.Certificate = Convert.ToBase64String(x509Certificate.Export(X509ContentType.Cert));
 
                 if (first)
@@ -490,7 +433,8 @@ namespace Raven.Server.Web.Authentication
                                 SecurityClearance = SecurityClearance.ClusterNode,
                                 Thumbprint = Server.Certificate.Certificate.Thumbprint,
                                 PublicKeyPinningHash = Server.Certificate.Certificate.GetPublicKeyPinningHash(),
-                                NotAfter = Server.Certificate.Certificate.NotAfter
+                                NotAfter = Server.Certificate.Certificate.NotAfter,
+                                NotBefore = Server.Certificate.Certificate.NotBefore
                             };
 
                             var serverCert = context.ReadObject(serverCertDef.ToJson(metadataOnly), "Server/Certificate/Definition");
@@ -584,6 +528,18 @@ namespace Raven.Server.Web.Authentication
                     continue;
                 }
 
+                if (def.NotBefore == null)
+                {
+                    // NotBefore will be null if the certificate was generated prior to adding the NotBefore property to class CertificateMetadata
+                    // So we are manually extracting this info - See issue RavenDB-18519
+                    var tempCertificate = CertificateLoaderUtil.CreateCertificate(Convert.FromBase64String(def.Certificate));
+                    using (tempCertificate) 
+                    {
+                          def.NotBefore = tempCertificate.NotBefore;
+                    }
+                    
+                }
+
                 var certificateRef = certificate;
                 if (metadataOnly)
                 {
@@ -630,7 +586,8 @@ namespace Raven.Server.Web.Authentication
                                 SecurityClearance = SecurityClearance.ClusterNode,
                                 Thumbprint = Server.Certificate.Certificate.Thumbprint,
                                 PublicKeyPinningHash = Server.Certificate.Certificate.GetPublicKeyPinningHash(),
-                                NotAfter = Server.Certificate.Certificate.NotAfter
+                                NotAfter = Server.Certificate.Certificate.NotAfter,
+                                NotBefore = Server.Certificate.Certificate.NotBefore
                             };
 
                             certificate = ctx.ReadObject(serverCertDef.ToJson(), "Server/Certificate/Definition");
@@ -705,7 +662,8 @@ namespace Raven.Server.Web.Authentication
                         SecurityClearance = newCertificate.SecurityClearance,
                         Thumbprint = existingCertificate.Thumbprint,
                         PublicKeyPinningHash = existingCertificate.PublicKeyPinningHash,
-                        NotAfter = existingCertificate.NotAfter
+                        NotAfter = existingCertificate.NotAfter,
+                        NotBefore = existingCertificate.NotBefore
                     }, GetRaftRequestIdFromQuery()));
                 await ServerStore.Cluster.WaitForIndexNotification(putResult.Index);
 
@@ -722,7 +680,7 @@ namespace Raven.Server.Web.Authentication
             var collection = new X509Certificate2Collection();
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
-                collection.Import(Server.Certificate.Certificate.Export(X509ContentType.Cert), (string)null, X509KeyStorageFlags.MachineKeySet);
+                CertificateLoaderUtil.Import(collection, Server.Certificate.Certificate.Export(X509ContentType.Cert));
 
                 if (ServerStore.CurrentRachisState != RachisState.Passive)
                 {
@@ -738,10 +696,10 @@ namespace Raven.Server.Web.Authentication
 
                             foreach (var cert in clusterNodes)
                             {
-                                var x509Certificate2 = new X509Certificate2(Convert.FromBase64String(cert.Certificate), (string)null, X509KeyStorageFlags.MachineKeySet);
+                                var x509Certificate2 = CertificateLoaderUtil.CreateCertificate(Convert.FromBase64String(cert.Certificate));
 
                                 if (collection.Contains(x509Certificate2) == false)
-                                    collection.Import(x509Certificate2.Export(X509ContentType.Cert), (string)null, X509KeyStorageFlags.MachineKeySet);
+                                    CertificateLoaderUtil.Import(collection, x509Certificate2.Export(X509ContentType.Cert));
                             }
                         }
                         finally
@@ -994,7 +952,7 @@ namespace Raven.Server.Web.Authentication
                             try
                             {
                                 var cert = new X509Certificate2Collection();
-                                cert.Import(certBytes, certificate.Password, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+                                CertificateLoaderUtil.Import(cert, certBytes, certificate.Password, CertificateLoaderUtil.FlagsForExport);
                                 // Exporting with the private key, but without the password
                                 certBytes = cert.Export(X509ContentType.Pkcs12);
                                 certificate.Certificate = Convert.ToBase64String(certBytes);
@@ -1008,7 +966,7 @@ namespace Raven.Server.Web.Authentication
                         // Ensure we'll be able to load the certificate
                         try
                         {
-                            var _ = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+                            var _ = CertificateLoaderUtil.CreateCertificate(certBytes, flags: CertificateLoaderUtil.FlagsForExport);
                         }
                         catch (Exception e)
                         {

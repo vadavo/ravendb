@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------
-//  <copyright file="MemoryUsageWidget.cs" company="Hibernating Rhinos LTD">
+//  <copyright file="MemoryUsageNotificationSender.cs" company="Hibernating Rhinos LTD">
 //      Copyright (c) Hibernating Rhinos LTD. All rights reserved.
 //  </copyright>
 // -----------------------------------------------------------------------
@@ -32,7 +32,7 @@ namespace Raven.Server.Dashboard.Cluster.Notifications
 
         protected override AbstractClusterDashboardNotification CreateNotification()
         {
-            var memoryInfo = _server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfoExtended);
+            var memoryInfo = _server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfoExtended.RefreshRate15Seconds);
             long managedMemoryInBytes = AbstractLowMemoryMonitor.GetManagedMemoryInBytes();
             long totalUnmanagedAllocations = NativeMemory.TotalAllocatedMemory;
             var encryptionBuffers = EncryptionBuffersPool.Instance.GetStats();

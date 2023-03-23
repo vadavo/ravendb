@@ -10,8 +10,16 @@ import copyToClipboard = require("common/copyToClipboard");
 import generalUtils = require("common/generalUtils");
 import getAdminLogsConfigurationCommand = require("commands/maintenance/getAdminLogsConfigurationCommand");
 import saveAdminLogsConfigurationCommand = require("commands/maintenance/saveAdminLogsConfigurationCommand");
+import datePickerBindingHandler = require("common/bindingHelpers/datePickerBindingHandler");
 import adminLogsOnDiskConfig = require("models/database/debug/adminLogsOnDiskConfig");
 import moment = require("moment");
+import endpoints = require("endpoints");
+import appUrl = require("common/appUrl");
+import adminLogsTrafficWatchDialog = require("./adminLogsTrafficWatchDialog");
+import app = require("durandal/app");
+import getTrafficWatchConfigurationCommand = require("commands/maintenance/getTrafficWatchConfigurationCommand");
+import trafficWatchConfiguration = require("models/resources/trafficWatchConfiguration");
+import saveTrafficWatchConfigurationCommand = require("commands/maintenance/saveTrafficWatchConfigurationCommand");
 
 class heightCalculator {
     
@@ -43,6 +51,7 @@ class heightCalculator {
         const initialHeight = row.element.height();
         let charactersInline = 1;
         
+        // eslint-disable-next-line no-constant-condition
         while (true) {
             row.populate(_.repeat("A", charactersInline), 0, -200, undefined);
             if (row.element.height() > initialHeight) {
@@ -84,6 +93,7 @@ class adminLogs extends viewModelBase {
     
     private onDiskConfiguration = ko.observable<adminLogsOnDiskConfig>();
     private configuration = ko.observable<adminLogsConfig>(adminLogsConfig.empty());
+    private trafficWatchConfiguration = ko.observable<trafficWatchConfiguration>();
     
     editedConfiguration = ko.observable<adminLogsConfig>(adminLogsConfig.empty());
     editedHeaderName = ko.observable<adminLogsHeaderType>("Source");
@@ -95,6 +105,8 @@ class adminLogs extends viewModelBase {
     private duringManualScrollEvent = false;
 
     validationGroup: KnockoutValidationGroup;
+    downloadLogsValidationGroup: KnockoutValidationGroup;
+    
     enableApply: KnockoutComputed<boolean>;
 
     isPauseLogs = ko.observable<boolean>(false);
@@ -102,14 +114,38 @@ class adminLogs extends viewModelBase {
     
     private static readonly studioMsgPart = "-, Information, Studio,";
     
+    datePickerOptions = {
+        format: "YYYY-MM-DD HH:mm:ss.SSS",
+        sideBySide: true
+    };
+
+    useMinStartDate = ko.observable<boolean>(false);
+    startDate = ko.observable<moment.Moment>();
+
+    useMaxEndDate = ko.observable<boolean>(false);
+    endDate = ko.observable<moment.Moment>();
+
+    startDateToUse: KnockoutComputed<string>;
+    endDateToUse: KnockoutComputed<string>;
+
+    trafficWatchEnabled: KnockoutComputed<boolean>;
+
+    // show user location of traffic watch in logs configuration button
+    highlightTrafficWatch: boolean;
+
+    static utcTimeFormat = "YYYY-MM-DD HH:mm:ss.SSS";
+    
     constructor() {
         super();
         
         this.bindToCurrentInstance("toggleTail", "itemHeightProvider", "applyConfiguration", "loadLogsConfig",
-            "includeFilter", "excludeFilter", "removeConfigurationEntry", "itemHtmlProvider", "setAdminLogMode");
+            "includeFilter", "excludeFilter", "removeConfigurationEntry", "itemHtmlProvider", "setAdminLogMode", 
+            "configureTrafficWatch");
         
         this.initObservables();
         this.initValidation();
+
+        datePickerBindingHandler.install();
     }
     
     private initObservables() {
@@ -137,6 +173,31 @@ class adminLogs extends viewModelBase {
                 }
             }
         });
+
+        this.startDateToUse = ko.pureComputed(() => {
+            return this.useMinStartDate() ? null : this.startDate().utc().format(generalUtils.utcFullDateFormat);
+        });
+
+        this.endDateToUse = ko.pureComputed(() => {
+            return this.useMaxEndDate() ? null : this.endDate().utc().format(generalUtils.utcFullDateFormat);
+        });
+        
+        this.trafficWatchEnabled = ko.pureComputed(() => {
+            const config = this.trafficWatchConfiguration();
+            return config?.enabled() ?? false;
+        });
+    }
+    
+    dateFormattedAsUtc(localDate: moment.Moment) {
+        if (localDate) {
+            const date = moment(localDate);
+            if (!date.isValid()) {
+                return "";
+            }
+            return date.utc().format(adminLogs.utcTimeFormat) + "Z (UTC)";
+        } else {
+            return "";
+        }
     }
     
     private initValidation() {
@@ -145,16 +206,72 @@ class adminLogs extends viewModelBase {
             min: 0
         });
 
+        this.startDate.extend({
+            required: {
+                onlyIf: () => !this.useMinStartDate()
+            },
+            validation: [
+                {
+                    validator: () => {
+                        if (this.useMinStartDate()) {
+                            return true;
+                        }
+                        return this.startDate().isValid();
+                    },
+                    message: "Please enter a valid date"
+                }
+            ]
+        });
+
+        this.endDate.extend({
+            required: {
+                onlyIf: () => !this.useMaxEndDate()
+            },
+            validation: [
+                {
+                    validator: () => {
+                        if (this.useMaxEndDate()) {
+                            return true;
+                        }
+                        return this.endDate().isValid();
+                    },
+                    message: "Please enter a valid date"
+                },
+                {
+                    validator: () => {
+                        if (this.useMaxEndDate() || this.useMinStartDate()) {
+                            return true;
+                        }
+
+                        if (!this.startDate() || !this.startDate().isValid()) {
+                            return true;
+                        }
+
+                        // at this point both start/end are defined and valid, we can compare
+                        return this.endDate().diff(this.startDate()) >= 0;
+                    },
+                    message: "End Date must be greater than Start Date"
+                }
+            ]
+        });
+
         this.validationGroup = ko.validatedObservable({
             maxEntries: this.editedConfiguration().maxEntries
+        });
+        
+        this.downloadLogsValidationGroup = ko.validatedObservable({
+            startDate: this.startDate,
+            endDate: this.endDate
         });
     }
     
     activate(args: any) {
         super.activate(args);
         this.updateHelpLink('57BGF7');
+
+        this.highlightTrafficWatch = !!args?.highlightTrafficWatch;
         
-        return this.loadLogsConfig(); 
+        return this.loadConfigs();
     }
     
     deactivate() {
@@ -165,9 +282,21 @@ class adminLogs extends viewModelBase {
         }
     }
     
+    loadConfigs() {
+        const logConfigsTask = this.loadLogsConfig();
+        const trafficWatchConfigTask = this.loadTrafficWatchConfig();
+        
+        return $.when<any>(logConfigsTask, trafficWatchConfigTask);
+    }
+    
     loadLogsConfig() {
         return new getAdminLogsConfigurationCommand().execute()
             .done(result => this.onDiskConfiguration(new adminLogsOnDiskConfig(result)));
+    }
+    
+    loadTrafficWatchConfig() {
+        return new getTrafficWatchConfigurationCommand().execute()
+            .done(result => this.trafficWatchConfiguration(new trafficWatchConfiguration(result)))
     }
 
     setAdminLogMode(newMode: Sparrow.Logging.LogMode) {
@@ -267,9 +396,15 @@ class adminLogs extends viewModelBase {
             .prepend(`<span ${addedClassHtml}>${generalUtils.escapeHtml(item)}</span>`)
             .prepend(`<a href="#" class="copy-item-button margin-right margin-right-sm flex-start" title="Copy log msg to clipboard"><i class="icon-copy"></i></a>`);
     }
-    
+
     compositionComplete() {
         super.compositionComplete();
+        
+        
+        if (this.highlightTrafficWatch) {
+            this.showTrafficWatchConfigurationLocation();
+        }
+        
         this.connectWebSocket();
         
         $(".admin-logs .viewport").on("scroll", () => {
@@ -285,6 +420,22 @@ class adminLogs extends viewModelBase {
             event.stopImmediatePropagation();
             copyToClipboard.copy($(this).next().text(), "Log message has been copied to clipboard");
         });
+    }
+    
+    private showTrafficWatchConfigurationLocation() {
+        setTimeout(() => {
+            $("#js-settings-btn").click();
+            
+            const blink = () => {
+                const element = $("#js-traffic-watch-config");
+                element.removeClass("blink-style");
+                setTimeout(() => element.addClass("blink-style"), 1);
+            }
+            
+            setTimeout(blink, 1000);
+            setTimeout(blink, 2000);
+        }, 400);
+        
     }
     
     connectWebSocket() {
@@ -303,10 +454,7 @@ class adminLogs extends viewModelBase {
     }
 
     isConnectedToWebSocket() {
-        if (this.liveClient() && this.liveClient().isConnected()) {
-            return true;
-        }
-        return false;
+        return this.liveClient() && this.liveClient().isConnected();
     }
     
     pauseLogs() {
@@ -452,9 +600,48 @@ class adminLogs extends viewModelBase {
         this.loadLogsConfig();
     }
     
+    onOpenDownload() {
+        this.startDate(null);
+        this.endDate(null);
+        
+        this.useMinStartDate(false);
+        this.useMaxEndDate(false);
+        
+        this.downloadLogsValidationGroup.errors.showAllMessages(false);
+    }
+
+    onDownloadLogs() {
+        if (!this.isValid(this.downloadLogsValidationGroup)) {
+            return;
+        }
+
+        const $form = $("#downloadLogsForm");
+        const url = endpoints.global.adminLogs.adminLogsDownload;
+        
+        $form.attr("action", appUrl.forServer() + url);
+
+        $("[name=from]", $form).val(this.startDateToUse());
+        $("[name=to]", $form).val(this.endDateToUse());
+
+        $form.submit();
+    }
+    
     updateMouseStatus(pressed: boolean) {
         this.mouseDown(pressed);
         return true;  // we want bubble and execute default action (selection)
+    }
+    
+    configureTrafficWatch() {
+        const configurationCopy = new trafficWatchConfiguration(this.trafficWatchConfiguration().toDto());
+
+        app.showBootstrapDialog(new adminLogsTrafficWatchDialog(configurationCopy))
+            .done(result => {
+                if (result) {
+                    this.trafficWatchConfiguration(result);
+                    new saveTrafficWatchConfigurationCommand(this.trafficWatchConfiguration().toDto())
+                        .execute();
+                }
+            });
     }
 }
 

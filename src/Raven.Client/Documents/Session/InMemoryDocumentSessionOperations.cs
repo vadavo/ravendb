@@ -265,7 +265,8 @@ namespace Raven.Client.Documents.Session
         }
 
         /// <summary>
-        /// Gets the metadata for the specified entity.
+        /// Gets the metadata for the specified instance.
+        /// Throws an exception if the instance is not tracked by the session.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <param name="instance">The instance.</param>
@@ -339,9 +340,8 @@ namespace Raven.Client.Documents.Session
         }
 
         /// <summary>
-        /// Gets the Change Vector for the specified entity.
-        /// If the entity is transient, it will load the change vector from the store
-        /// and associate the current state of the entity with the change vector from the server.
+        /// Gets the Change Vector for the specified instance.
+        /// Throws an exception if the instance is not tracked by the session.
         /// </summary>
         /// <param name="instance">The instance.</param>
         /// <returns></returns>
@@ -536,6 +536,7 @@ more responsive application.
                     IncludedDocumentsById.Remove(id);
                     DocumentsByEntity[docInfo.Entity] = docInfo;
                 }
+                OnAfterConversionToEntityInvoke(id, docInfo.Document, docInfo.Entity);
 
                 return docInfo.Entity;
             }
@@ -551,6 +552,7 @@ more responsive application.
                     DocumentsById.Add(docInfo);
                     DocumentsByEntity[docInfo.Entity] = docInfo;
                 }
+                OnAfterConversionToEntityInvoke(id, docInfo.Document, docInfo.Entity);
 
                 return docInfo.Entity;
             }
@@ -574,6 +576,7 @@ more responsive application.
                 DocumentsById.Add(newDocumentInfo);
                 DocumentsByEntity[entity] = newDocumentInfo;
             }
+            OnAfterConversionToEntityInvoke(id, document, entity);
 
             return entity;
         }
@@ -928,32 +931,31 @@ more responsive application.
 
         protected internal abstract ClusterTransactionOperationsBase GetClusterSession();
 
-        private static bool UpdateMetadataModifications(DocumentInfo documentInfo)
+        internal static bool UpdateMetadataModifications(IMetadataDictionary metadataDictionary, BlittableJsonReaderObject metadata)
         {
-            if ((documentInfo.MetadataInstance == null ||
-                ((MetadataAsDictionary)documentInfo.MetadataInstance).Changed == false) &&
-                (documentInfo.Metadata.Modifications == null ||
-                documentInfo.Metadata.Modifications.Properties.Count == 0))
+            if ((metadataDictionary == null ||
+                 ((MetadataAsDictionary)metadataDictionary).Changed == false) &&
+                (metadata?.Modifications == null ||
+                 metadata.Modifications.Properties.Count == 0))
                 return false;
 
-            if (documentInfo.Metadata.Modifications == null || documentInfo.Metadata.Modifications.Properties.Count == 0)
+            if (metadata.Modifications == null || metadata.Modifications.Properties.Count == 0)
             {
-                documentInfo.Metadata.Modifications = new DynamicJsonValue();
+                metadata.Modifications = new DynamicJsonValue();
             }
 
-            if (documentInfo.MetadataInstance != null)
+            if (metadataDictionary != null)
             {
-                foreach (var prop in documentInfo.MetadataInstance.Keys)
+                foreach (var prop in metadataDictionary.Keys)
                 {
-                    var result = documentInfo.MetadataInstance[prop];
-                    if(result is IMetadataDictionary md)
+                    var result = metadataDictionary[prop];
+                    if (result is IMetadataDictionary md)
                     {
                         result = HandleDictionaryObject(md);
                     }
-                    documentInfo.Metadata.Modifications[prop] =  result;
+                    metadata.Modifications[prop] = result;
                 }
             }
-
             return true;
         }
 
@@ -1066,7 +1068,7 @@ more responsive application.
                     if (IsDeleted(entity.Value.Id))
                         continue;
 
-                    var metadataUpdated = UpdateMetadataModifications(entity.Value);
+                    var metadataUpdated = UpdateMetadataModifications(entity.Value.MetadataInstance, entity.Value.Metadata);
 
                     var document = JsonConverter.ToBlittable(entity.Key, entity.Value);
 
@@ -1085,7 +1087,7 @@ more responsive application.
                         var beforeStoreEventArgs = new BeforeStoreEventArgs(this, entity.Value.Id, entity.Key);
                         onOnBeforeStore(this, beforeStoreEventArgs);
                         if (metadataUpdated || beforeStoreEventArgs.MetadataAccessed)
-                            metadataUpdated |= UpdateMetadataModifications(entity.Value);
+                            metadataUpdated |= UpdateMetadataModifications(entity.Value.MetadataInstance, entity.Value.Metadata);
                         if (beforeStoreEventArgs.MetadataAccessed ||
                             EntityChanged(document, entity.Value, null))
                         {
@@ -1183,6 +1185,25 @@ more responsive application.
             return changes;
         }
 
+        public IDictionary<string, EntityInfo> GetTrackedEntities()
+        {
+            var tracked = DocumentsById.GetTrackedEntities(this);
+
+            foreach (var id in _knownMissingIds)
+            {
+                if (tracked.ContainsKey(id))
+                    continue;
+
+                tracked.Add(id, new EntityInfo
+                {
+                    Id = id,
+                    IsDeleted = true
+                });
+            }
+
+            return tracked;
+        }
+
         /// <summary>
         /// Gets a value indicating whether any of the entities tracked by the session has changes.
         /// </summary>
@@ -1263,7 +1284,7 @@ more responsive application.
         {
             foreach (var pair in DocumentsById)
             {
-                UpdateMetadataModifications(pair.Value);
+                UpdateMetadataModifications(pair.Value.MetadataInstance, pair.Value.Metadata);
                 var newObj = JsonConverter.ToBlittable(pair.Value.Entity, pair.Value);
                 EntityChanged(newObj, pair.Value, changes);
             }
@@ -2155,7 +2176,9 @@ more responsive application.
         private object DeserializeFromTransformer(Type entityType, string id, BlittableJsonReaderObject document, bool trackEntity)
         {
             HandleInternalMetadata(document);
-            return JsonConverter.FromBlittable(entityType, ref document, id, trackEntity);
+            var entity = JsonConverter.FromBlittable(entityType, ref document, id, trackEntity);
+            OnAfterConversionToEntityInvoke(id, document, entity);
+            return entity;
         }
         
         internal bool CheckIfAllChangeVectorsAreAlreadyIncluded(IEnumerable<string> changeVectors)
@@ -2254,6 +2277,7 @@ more responsive application.
             if (DocumentsById.TryGetValue(documentInfo.Id, out DocumentInfo documentInfoById))
                 documentInfoById.Entity = entity;
 
+            OnAfterConversionToEntityInvoke(documentInfo.Id, documentInfo.Document, documentInfo.Entity);
         }
 
         protected static T GetOperationResult<T>(object result)

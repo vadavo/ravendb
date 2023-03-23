@@ -9,6 +9,7 @@ using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Server.Documents.Replication.ReplicationItems;
+using Raven.Server.Documents.Revisions;
 using Raven.Server.ServerWide.Context;
 using Sparrow;
 using Sparrow.Binary;
@@ -171,8 +172,9 @@ namespace Raven.Server.Documents
                 // This will validate that we cannot put an attachment on a conflicted document
                 var hasDoc = TryGetDocumentTableValueReaderForAttachment(context, documentId, name, lowerDocumentId, out TableValueReader tvr);
                 if (hasDoc == false)
-                    throw new InvalidOperationException($"Cannot put attachment {name} on a non existent document '{documentId}'.");
-                if (TableValueToFlags((int)DocumentsTable.Flags, ref tvr).HasFlag(DocumentFlags.Artificial))
+                    throw new DocumentDoesNotExistException($"Cannot put attachment {name} on a non existent document '{documentId}'.");
+                var flags = TableValueToFlags((int)DocumentsTable.Flags, ref tvr);
+                if (flags.HasFlag(DocumentFlags.Artificial))
                     throw new InvalidOperationException($"Cannot put attachment {name} on artificial document '{documentId}'.");
 
                 using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(context, name, out Slice lowerName, out Slice namePtr))
@@ -235,6 +237,19 @@ namespace Raven.Server.Documents
                                         ThrowConcurrentException(documentId, name, expectedChangeVector, oldChangeVector);
                                 }
 
+                                var doc = _documentsStorage.TableValueToDocument(context, ref tvr);
+                                var collection = _documentsStorage.ExtractCollectionName(context, doc.Data);
+
+                                var configuration = _documentsStorage.RevisionsStorage.GetRevisionsConfiguration(collection.Name, doc.Flags);
+                                if (configuration != null)
+                                {
+                                    var shouldVersionOldDoc = _documentsStorage.RevisionsStorage.ShouldVersionOldDocument(context, flags, doc.Data, doc.ChangeVector, collection);
+                                    if (shouldVersionOldDoc)
+                                    {
+                                        _documentsStorage.RevisionsStorage.Put(context, documentId, doc.Data, flags | DocumentFlags.HasRevisions | DocumentFlags.FromOldDocumentRevision, NonPersistentDocumentFlags.None, doc.ChangeVector, doc.LastModified.Ticks, configuration, collection);
+                                    }
+                                }
+
                                 // Delete the attachment stream only if we have a different hash
                                 using (TableValueToSlice(context, (int)AttachmentsTable.Hash, ref partialTvr, out Slice existingHash))
                                 {
@@ -242,7 +257,7 @@ namespace Raven.Server.Documents
                                     if (putStream)
                                     {
                                         using (TableValueToSlice(context, (int)AttachmentsTable.LowerDocumentIdAndLowerNameAndTypeAndHashAndContentType,
-                                            ref partialTvr, out Slice existingKey))
+                                                   ref partialTvr, out Slice existingKey))
                                         {
                                             var existingEtag = TableValueToEtag((int)AttachmentsTable.Etag, ref partialTvr);
                                             var lastModifiedTicks = _documentDatabase.Time.GetUtcNow().Ticks;
@@ -1259,6 +1274,10 @@ namespace Raven.Server.Documents
             var newEtag = _documentsStorage.GenerateNextEtag();
 
             var table = context.Transaction.InnerTransaction.OpenTable(TombstonesSchema, AttachmentsTombstonesSlice);
+
+            if (table.VerifyKeyExists(keySlice))
+                return; // attachments (and attachment tombstones) are immutable, we can safely ignore this
+
             using (table.Allocate(out TableValueBuilder tvb))
             using (Slice.From(context.Allocator, changeVector, out var cv))
             {

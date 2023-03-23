@@ -6,6 +6,7 @@ import addWidgetModal = require("viewmodels/resources/addWidgetModal");
 import clusterTopologyManager = require("common/shell/clusterTopologyManager");
 import memoryUsageWidget = require("viewmodels/resources/widgets/memoryUsageWidget");
 import cpuUsageWidget = require("viewmodels/resources/widgets/cpuUsageWidget");
+import ioStatsWidget = require("viewmodels/resources/widgets/ioStatsWidget");
 import licenseWidget = require("viewmodels/resources/widgets/licenseWidget");
 import storageWidget = require("viewmodels/resources/widgets/storageWidget");
 import clusterNode = require("models/database/cluster/clusterNode");
@@ -18,6 +19,7 @@ import databaseStorageWidget = require("viewmodels/resources/widgets/databaseSto
 import databaseTrafficWidget = require("viewmodels/resources/widgets/databaseTrafficWidget");
 import databaseOverviewWidget = require("viewmodels/resources/widgets/databaseOverviewWidget");
 import ongoingTasksWidget = require("viewmodels/resources/widgets/ongoingTasksWidget");
+import clusterOverviewWidget = require("viewmodels/resources/widgets/clusterOverviewWidget");
 import storageKeyProvider = require("common/storage/storageKeyProvider");
 import Packery = require("packery");
 import Draggabilly = require("draggabilly");
@@ -89,36 +91,41 @@ class clusterDashboard extends viewModelBase {
         this.resizeObserver.observe(this.htmlElement);
         
         const throttledLayoutSave = _.debounce(() => {
-            const packeryWidth = this.packery.packer.width;
-            const layout = this.widgets().map(x => {
-                const packeryItem = this.packery.getItem(x.container);
-                return {
-                    left: packeryItem.rect.x / packeryWidth,
-                    top: packeryItem.rect.y,
-                    widget: x
-                }
-            });
-            
-            const sortedLayout = layout.sort((a, b) => a.top === b.top ? a.left - b.left : a.top - b.top);
-            
-            const columnsCount = this.getNumberOfColumnsInPackeryLayout();
-            
-            const widgetsLayout: savedWidgetsLayout = {
-                widgets: sortedLayout.map(x => ({
-                    type: x.widget.getType(),
-                    fullscreen: x.widget.fullscreen(),
-                    config: x.widget.getConfiguration(),
-                    state: x.widget.getState(),
-                    columnIndex: clusterDashboard.getColumnIndex(x.left, columnsCount)
-                })),
-                columns: columnsCount
-            };
-            localStorage.setObject(clusterDashboard.localStorageName, widgetsLayout);
+            this.saveToLocalStorage();
         }, 5_000);
 
         this.packery.on("layoutComplete", throttledLayoutSave);
 
         this.initialized(true);
+    }
+
+    saveToLocalStorage() {
+        const packeryWidth = this.packery.packer.width;
+        const layout = this.widgets().map(x => {
+            const packeryItem = this.packery.getItem(x.container);
+            return {
+                left: packeryItem.rect.x / packeryWidth,
+                top: packeryItem.rect.y,
+                widget: x
+            }
+        });
+
+        const sortedLayout = layout.sort((a, b) => a.top === b.top ? a.left - b.left : a.top - b.top);
+
+        const columnsCount = this.getNumberOfColumnsInPackeryLayout();
+
+        const widgetsLayout: savedWidgetsLayout = {
+            widgets: sortedLayout.map(x => ({
+                type: x.widget.getType(),
+                fullscreen: x.widget.fullscreen(),
+                config: x.widget.getConfiguration(),
+                state: x.widget.getState(),
+                columnIndex: clusterDashboard.getColumnIndex(x.left, columnsCount)
+            })),
+            columns: columnsCount
+        };
+
+        localStorage.setObject(clusterDashboard.localStorageName, widgetsLayout);
     }
     
     private static getColumnIndex(leftPositionPercentage: number, totalColumns: number): number {
@@ -239,6 +246,9 @@ class clusterDashboard extends viewModelBase {
                 });
         } else {
             this.addWidget(new cpuUsageWidget(this));
+            if (clusterTopologyManager.default.hasAnyNodeWithOs("Linux")) {
+                this.addWidget(new ioStatsWidget(this));
+            }
             this.addWidget(new trafficWidget(this));
             this.addWidget(new databaseTrafficWidget(this));
             this.addWidget(new databaseIndexingWidget(this));
@@ -250,6 +260,7 @@ class clusterDashboard extends viewModelBase {
             this.addWidget(new welcomeWidget(this));
             this.addWidget(new databaseOverviewWidget(this));
             this.addWidget(new ongoingTasksWidget(this));
+            this.addWidget(new clusterOverviewWidget(this));
             
             const initialWidgets = this.widgets();
             
@@ -331,7 +342,7 @@ class clusterDashboard extends viewModelBase {
         }
     }
 
-    layout(withDelay: boolean = true, mode: "shift" | "full" = "full") {
+    layout(withDelay = true, mode: "shift" | "full" = "full") {
         const layoutAction = () => {
             mode === "full" ? this.packery.layout() : this.packery.shiftLayout();
         }
@@ -387,7 +398,7 @@ class clusterDashboard extends viewModelBase {
         app.showBootstrapDialog(addWidgetView);
     }
     
-    spawnWidget(type: widgetType, fullscreen: boolean = false, config: any = undefined, state: any = undefined) {
+    spawnWidget(type: widgetType, fullscreen = false, config: any = undefined, state: any = undefined) {
         let widget: widget<any>;
         
         switch (type) {
@@ -396,6 +407,9 @@ class clusterDashboard extends viewModelBase {
                 break;
             case "CpuUsage":
                 widget = new cpuUsageWidget(this);
+                break;
+            case "IoStats":
+                widget = new ioStatsWidget(this);
                 break;
             case "License":
                 widget = new licenseWidget(this);
@@ -426,6 +440,9 @@ class clusterDashboard extends viewModelBase {
                 break;
             case "OngoingTasks":
                 widget = new ongoingTasksWidget(this);
+                break;
+            case "ClusterOverview":
+                widget = new clusterOverviewWidget(this);
                 break;
             default:
                 throw new Error("Unsupported widget type = " + type);

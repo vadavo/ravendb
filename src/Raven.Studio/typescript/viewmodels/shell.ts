@@ -19,7 +19,6 @@ import allRoutes = require("common/shell/routes");
 import popoverUtils = require("common/popoverUtils");
 import registration = require("viewmodels/shell/registration");
 import collection = require("models/database/documents/collection");
-import constants = require("common/constants/constants");
 
 import appUrl = require("common/appUrl");
 import autoCompleteBindingHandler = require("common/bindingHelpers/autoCompleteBindingHandler");
@@ -138,10 +137,6 @@ class shell extends viewModelBase {
         this.clientBuildVersion.subscribe(v =>
             viewModelBase.clientVersion(v.Version));
 
-        buildInfo.serverBuildVersion.subscribe(buildVersionDto => {
-            this.initAnalytics([ buildVersionDto ]);
-        });
-
         activeDatabaseTracker.default.database.subscribe(newDatabase => footer.default.forDatabase(newDatabase));
 
         studioSettings.default.configureLoaders(() => new getGlobalStudioConfigurationCommand().execute(),
@@ -152,7 +147,7 @@ class shell extends viewModelBase {
         
         this.browserAlert = new detectBrowser(true);
         
-        window.addEventListener("hashchange", e => {
+        window.addEventListener("hashchange", () => {
             this.currentUrlHash(location.hash);
         });
         
@@ -173,7 +168,7 @@ class shell extends viewModelBase {
     }
     
     // Override canActivate: we can always load this page, regardless of any system db prompt.
-    canActivate(args: any): any {
+    canActivate(): any {
         return true;
     }
 
@@ -181,7 +176,7 @@ class shell extends viewModelBase {
         super.activate(args, { shell: true });
 
         this.fetchClientBuildVersion();
-        this.fetchServerBuildVersion();
+        const buildVersionTask = this.fetchServerBuildVersion();
 
         const licenseTask = license.fetchLicenseStatus();
         const topologyTask = this.clusterManager.init();
@@ -193,8 +188,15 @@ class shell extends viewModelBase {
             }
         });
         
+        $.when<any>(buildVersionTask, licenseTask)
+            .done(() => {
+                this.initAnalytics();
+            });
+        
         $.when<any>(licenseTask, topologyTask, clientCertificateTask)
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
             .done(([license]: [Raven.Server.Commercial.LicenseStatus], 
+                   // eslint-disable-next-line @typescript-eslint/no-unused-vars
                    [topology]: [Raven.Server.NotificationCenter.Notifications.Server.ClusterTopologyChanged],
                    [certificate]: [Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition]) => {
             
@@ -205,7 +207,7 @@ class shell extends viewModelBase {
                 studioSettings.default.globalSettings()
                     .done((settings: globalSettings) => this.onGlobalConfiguration(settings));
                 
-                studioSettings.default.registerOnSettingChangedHandler(name => true, (name: string, setting: studioSetting<any>) => {
+                studioSettings.default.registerOnSettingChangedHandler(() => true, (name: string, setting: studioSetting<any>) => {
                     // if any remote configuration was changed, then force reload
                     if (setting.saveLocation === "remote") {
                         studioSettings.default.globalSettings()
@@ -229,22 +231,24 @@ class shell extends viewModelBase {
                 // "http"
                 if (location.protocol === "http:") {
                     this.accessManager.securityClearance("ClusterAdmin");
-                    this.accessManager.unsecureServer(true);
+                    this.accessManager.secureServer(false);
                 } else {
                     // "https"
                     if (certificate) {
                         this.accessManager.securityClearance(certificate.SecurityClearance);
                         accessManager.clientCertificateThumbprint(certificate.Thumbprint);
 
-                        let databasesAccess: dictionary<databaseAccessLevel> = {};
-                        for (let key in certificate.Permissions) {
-                            let access = certificate.Permissions[key];
+                        const databasesAccess: dictionary<databaseAccessLevel> = {};
+                        for (const key in certificate.Permissions) {
+                            const access = certificate.Permissions[key];
                             databasesAccess[`${key}`] = `Database${access}` as databaseAccessLevel;
                         }
                         accessManager.databasesAccess = databasesAccess;
+                        this.accessManager.secureServer(true);
                         
                     } else {
                         this.accessManager.securityClearance("ValidUser");
+                        this.accessManager.secureServer(false);
                     }
                 }
             })
@@ -272,7 +276,7 @@ class shell extends viewModelBase {
     }
     
     private setupRouting() {
-        const routes = allRoutes.get(this.appUrls);
+        const routes = allRoutes.get();
         routes.push(...routes);
         router.map(routes).buildNavigationModel();
 
@@ -331,8 +335,8 @@ class shell extends viewModelBase {
 
     private initializeShellComponents() {
         this.mainMenu.initialize();
-        let updateMenu = (db: database) => {
-            let items = generateMenuItems(db);
+        const updateMenu = (db: database) => {
+            const items = generateMenuItems(db);
             this.mainMenu.update(items);
         };
 
@@ -404,20 +408,15 @@ class shell extends viewModelBase {
         return this.databasesManager.init();
     }
 
-    fetchServerBuildVersion() {
-        new getServerBuildVersionCommand()
+    fetchServerBuildVersion(): JQueryPromise<serverBuildVersionDto> {
+        return new getServerBuildVersionCommand()
             .execute()
             .done((serverBuildResult: serverBuildVersionDto, status: string, response: JQueryXHR) => {
                
                 serverTime.default.calcTimeDifference(response.getResponseHeader("Date"));
                 serverTime.default.setStartUpTime(response.getResponseHeader("Server-Startup-Time"));
                 
-                buildInfo.serverBuildVersion(serverBuildResult);
-
-                const currentBuildVersion = serverBuildResult.BuildVersion;
-                if (currentBuildVersion !== constants.DEV_BUILD_NUMBER) {
-                    buildInfo.serverMainVersion(Math.floor(currentBuildVersion / 10000));
-                }
+                buildInfo.onServerBuildVersion(serverBuildResult);
             });
     }
 
@@ -433,7 +432,7 @@ class shell extends viewModelBase {
         this.navigate(this.appUrls.adminSettingsCluster());
     }
 
-    private initAnalytics(buildVersionResult: [serverBuildVersionDto]) {
+    private initAnalytics() {
         if (eventsCollector.gaDefined()) {
             
             studioSettings.default.globalSettings()
@@ -451,19 +450,19 @@ class shell extends viewModelBase {
                                 this.displayUsageStatsInfo(false);
 
                                 if (accepted) {
-                                    this.configureAnalytics(true, buildVersionResult);
+                                    this.configureAnalytics(true);
                                 }
 
                                 settings.sendUsageStats.setValue(accepted);
                             });
                         }
                     } else {
-                        this.configureAnalytics(shouldTraceUsageMetrics, buildVersionResult);
+                        this.configureAnalytics(shouldTraceUsageMetrics);
                     }
             });
         } else {
             // user has uBlock etc?
-            this.configureAnalytics(false, buildVersionResult);
+            this.configureAnalytics(false);
         }
     }
 
@@ -475,18 +474,14 @@ class shell extends viewModelBase {
         this.trackingTask.resolve(false);
     }
 
-    private configureAnalytics(track: boolean, [buildVersionResult]: [serverBuildVersionDto]) {
-        const currentBuildVersion = buildVersionResult.BuildVersion;
-        const shouldTrack = track && currentBuildVersion !== constants.DEV_BUILD_NUMBER;
-        if (currentBuildVersion !== constants.DEV_BUILD_NUMBER) {
-            buildInfo.serverMainVersion(Math.floor(currentBuildVersion / 10000));
-        }
+    private configureAnalytics(track: boolean) {
+        const currentBuildVersion = buildInfo.serverBuildVersion().BuildVersion;
+        const shouldTrack = track && !buildInfo.isDevVersion();
 
         const licenseStatus = license.licenseStatus();
         const env = licenseStatus ? licenseStatus.Type : "N/A";
-        const version = buildVersionResult.FullVersion;
-        eventsCollector.default.initialize(
-            buildInfo.serverMainVersion() + "." + buildInfo.serverMinorVersion(), currentBuildVersion, env, version, shouldTrack);
+        const fullVersion = buildInfo.serverBuildVersion().FullVersion;
+        eventsCollector.default.initialize(buildInfo.mainVersion(), currentBuildVersion, env, fullVersion, shouldTrack);
         
         studioSettings.default.registerOnSettingChangedHandler(
             name => name === "sendUsageStats",

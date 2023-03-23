@@ -8,7 +8,7 @@ class ipEntry {
    
    isLocalNetwork: KnockoutComputed<boolean>;
 
-   static runningOnDocker: boolean = false;
+   static runningOnDocker = false;
    
    constructor(allowHostname: boolean) {
        
@@ -33,7 +33,7 @@ class ipEntry {
            }];
        
        
-       this.ip.extend(extenders);      
+       this.ip.extend(extenders);
        
        this.validationGroup = ko.validatedObservable({
            ip: this.ip
@@ -41,7 +41,8 @@ class ipEntry {
        
        this.isLocalNetwork = ko.pureComputed(() => {
            const ip = this.ip();
-           if (!ip) {
+           
+           if (!ip || !this.validationGroup.isValid()) {
                return false;
            }
            

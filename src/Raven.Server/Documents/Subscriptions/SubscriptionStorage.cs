@@ -35,8 +35,8 @@ namespace Raven.Server.Documents.Subscriptions
     {
         internal readonly DocumentDatabase _db;
         private readonly ServerStore _serverStore;
-        
-        private readonly ConcurrentDictionary<long, SubscriptionConnectionsState> _subscriptions = new ();
+
+        private readonly ConcurrentDictionary<long, SubscriptionConnectionsState> _subscriptions = new();
         private readonly Logger _logger;
         private readonly SemaphoreSlim _concurrentConnectionsSemiSemaphore;
 
@@ -78,6 +78,7 @@ namespace Raven.Server.Documents.Subscriptions
                 InitialChangeVector = options.ChangeVector,
                 SubscriptionName = options.Name,
                 SubscriptionId = subscriptionId,
+                PinToMentorNode = options.PinToMentorNode,
                 Disabled = disabled ?? false
             };
 
@@ -93,7 +94,7 @@ namespace Raven.Server.Documents.Subscriptions
                 // updated existing subscription
                 return subscriptionId.Value;
             }
-            
+
             _db.SubscriptionStorage.RaiseNotificationForTaskAdded(options.Name);
 
             return etag;
@@ -123,7 +124,7 @@ namespace Raven.Server.Documents.Subscriptions
             await _db.RachisLogIndexNotifications.WaitForIndexNotification(etag, _serverStore.Engine.OperationTimeout);
             return etag;
         }
-        
+
         public async Task LegacyAcknowledgeBatchProcessed(long subscriptionId, string name, string changeVector, string previousChangeVector)
         {
             var command = new AcknowledgeSubscriptionBatchCommand(_db.Name, RaftIdGenerator.NewId())
@@ -328,6 +329,25 @@ namespace Raven.Server.Documents.Subscriptions
             return true;
         }
 
+        public bool DeleteAndSetException(long subscriptionId, SubscriptionException ex)
+        {
+            if (_subscriptions.TryRemove(subscriptionId, out SubscriptionConnectionsState state) == false)
+                return false;
+
+            foreach (var connection in state.GetConnections())
+            {
+                // this is just to set appropriate exception, the connections will be dropped on state dispose
+                connection.ConnectionException = ex;
+            }
+
+            state.Dispose();
+
+            if (_logger.IsInfoEnabled)
+                _logger.Info($"Subscription with id '{subscriptionId}' and name '{state.SubscriptionName}' was deleted and connections were dropped.", ex);
+
+            return true;
+        }
+
         public bool DropSingleSubscriptionConnection(long subscriptionId, string workerId, SubscriptionException ex)
         {
             if (_subscriptions.TryGetValue(subscriptionId, out SubscriptionConnectionsState subscriptionConnectionsState) == false)
@@ -336,7 +356,7 @@ namespace Raven.Server.Documents.Subscriptions
             var connectionToDrop = subscriptionConnectionsState.GetConnections().FirstOrDefault(conn => conn.WorkerId == workerId);
             if (connectionToDrop == null)
                 return false;
-            
+
             subscriptionConnectionsState.DropSingleConnection(connectionToDrop, ex);
             if (_logger.IsInfoEnabled)
                 _logger.Info(
@@ -409,7 +429,7 @@ namespace Raven.Server.Documents.Subscriptions
                 };
             }
         }
-        
+
         public static IEnumerable<ResendItem> GetResendItems(ClusterOperationContext context, string database, long id)
         {
             var subscriptionState = context.Transaction.InnerTransaction.OpenTable(ClusterStateMachine.SubscriptionStateSchema, ClusterStateMachine.SubscriptionState);
@@ -417,7 +437,7 @@ namespace Raven.Server.Documents.Subscriptions
             using (Slice.External(context.Allocator, prefix, out var prefixSlice))
             {
                 var resendItem = new ResendItem();
-             
+
                 foreach (var item in subscriptionState.SeekByPrimaryKeyPrefix(prefixSlice, Slices.Empty, 0))
                 {
                     resendItem.Type = (SubscriptionType)item.Key[prefixSlice.Size];
@@ -435,7 +455,7 @@ namespace Raven.Server.Documents.Subscriptions
             foreach (var kvp in _subscriptions)
             {
                 var subscriptionConnectionsState = kvp.Value;
-                
+
                 if (subscriptionConnectionsState.IsSubscriptionActive() == false)
                     continue;
 
@@ -452,6 +472,20 @@ namespace Raven.Server.Documents.Subscriptions
                 GetRunningSubscriptionInternal(history, subscriptionData, subscriptionConnectionsState);
                 yield return subscriptionData;
             }
+        }
+
+        public int GetNumberOfRunningSubscriptions()
+        {
+            var c = 0;
+            foreach ((_, SubscriptionConnectionsState value) in _subscriptions)
+            {
+                if (value.IsSubscriptionActive() == false)
+                    continue;
+
+                c++;
+            }
+
+            return c;
         }
 
         public SubscriptionGeneralDataAndStats GetSubscription(TransactionOperationContext context, long? id, string name, bool history)
@@ -528,7 +562,7 @@ namespace Raven.Server.Documents.Subscriptions
 
             if (_subscriptions.TryGetValue(subscriptionId, out var concurrentSubscription) == false)
                 return false;
-            
+
             if (concurrentSubscription == null)
                 return false;
 
@@ -567,6 +601,7 @@ namespace Raven.Server.Documents.Subscriptions
                 SubscriptionId = @base.SubscriptionId;
                 SubscriptionName = @base.SubscriptionName;
                 MentorNode = @base.MentorNode;
+                PinToMentorNode = @base.PinToMentorNode;
                 NodeTag = @base.NodeTag;
                 LastBatchAckTime = @base.LastBatchAckTime;
                 LastClientConnectionTime = @base.LastClientConnectionTime;
@@ -624,11 +659,11 @@ namespace Raven.Server.Documents.Subscriptions
                     var subscriptionName = subscriptionStateKvp.Value.SubscriptionName;
                     if (subscriptionName == null)
                         continue;
-                    
+
                     var subscriptionBlittable = _serverStore.Cluster.Read(context, SubscriptionState.GenerateSubscriptionItemKeyName(databaseRecord.DatabaseName, subscriptionName));
                     if (subscriptionBlittable == null)
                     {
-                        DropSubscriptionConnections(subscriptionStateKvp.Key, new SubscriptionDoesNotExistException($"The subscription {subscriptionName} had been deleted"));
+                        DeleteAndSetException(subscriptionStateKvp.Key, new SubscriptionDoesNotExistException($"The subscription {subscriptionName} had been deleted"));
                         continue;
                     }
 
@@ -647,8 +682,8 @@ namespace Raven.Server.Documents.Subscriptions
                         DropSubscriptionConnections(subscriptionStateKvp.Key, new SubscriptionClosedException($"The subscription {subscriptionName} query has been modified, connection must be restarted", canReconnect: true));
                         continue;
                     }
-                    
-                    if (subscriptionState.LastClientConnectionTime == null && 
+
+                    if (subscriptionState.LastClientConnectionTime == null &&
                         subscriptionState.ChangeVectorForNextBatchStartingPoint != subscriptionConnectionsState.LastChangeVectorSent)
                     {
                         DropSubscriptionConnections(subscriptionStateKvp.Key, new SubscriptionClosedException($"The subscription {subscriptionName} was modified, connection must be restarted", canReconnect: true));
@@ -715,22 +750,22 @@ namespace Raven.Server.Documents.Subscriptions
         {
             // nothing to do here
         }
-        
+
         public void RaiseNotificationForTaskAdded(string subscriptionName)
         {
             OnAddTask?.Invoke(subscriptionName);
         }
-        
+
         public void RaiseNotificationForTaskRemoved(string subscriptionName)
         {
             OnRemoveTask?.Invoke(subscriptionName);
         }
-        
+
         public void RaiseNotificationForConnectionEnded(SubscriptionConnection connection)
         {
             OnEndConnection?.Invoke(connection);
         }
-        
+
         public void RaiseNotificationForBatchEnded(string subscriptionName, SubscriptionBatchStatsAggregator batchAggregator)
         {
             OnEndBatch?.Invoke(subscriptionName, batchAggregator);

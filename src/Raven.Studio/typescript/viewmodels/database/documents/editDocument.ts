@@ -42,13 +42,8 @@ import forceRevisionCreationCommand = require("commands/database/documents/force
 import getTimeSeriesStatsCommand = require("commands/database/documents/timeSeries/getTimeSeriesStatsCommand");
 import studioSettings = require("common/settings/studioSettings");
 import globalSettings = require("common/settings/globalSettings");
-import accessManager = require("common/shell/accessManager");
+import fileDownloader = require("common/fileDownloader");
 import moment = require("moment");
-
-interface revisionToCompare {
-    date: string;
-    changeVector: string;
-}
 
 class editDocument extends viewModelBase {
 
@@ -58,6 +53,7 @@ class editDocument extends viewModelBase {
     static documentNameSelector = "#documentName";
     static docEditorSelector = "#docEditor";
     static docEditorSelectorRight = "#docEditorRight";
+    static readonly hugeSizeFormatted = document.hugeSizeFormatted;
 
     inReadOnlyMode = ko.observable<boolean>(false);
     inDiffMode = ko.observable<boolean>(false);
@@ -67,8 +63,12 @@ class editDocument extends viewModelBase {
     leftRevisionIsNewer: KnockoutComputed<boolean>;
     
     revisionChangeVector = ko.observable<string>();
+    
     document = ko.observable<document>();
+    documentItemType: KnockoutComputed<string>;
+    
     documentText = ko.observable("");
+    documentTextOrg = ko.observable("");
     documentTextRight = ko.observable("");
     
     documentTextStash = ko.observable<string>("");
@@ -83,7 +83,11 @@ class editDocument extends viewModelBase {
     lastModifiedAsAgo: KnockoutComputed<string>;
     latestRevisionUrl: KnockoutComputed<string>;
     rawJsonUrl: KnockoutComputed<string>;
+    
     isDeleteRevision: KnockoutComputed<boolean>;
+    isConflictRevision: KnockoutComputed<boolean>;
+    isResolvedRevision: KnockoutComputed<boolean>;
+    revisionText: KnockoutComputed<string>;
 
     createTimeSeriesUrl: KnockoutComputed<string>;
 
@@ -97,7 +101,6 @@ class editDocument extends viewModelBase {
     propertiesPanelVisible = ko.observable(true);
 
     globalValidationGroup = ko.validatedObservable({
-        userDocumentId: this.userSpecifiedId,
         userDocumentText: this.documentText
     });
     
@@ -142,8 +145,13 @@ class editDocument extends viewModelBase {
     isSaveEnabled: KnockoutComputed<boolean>;
     
     computedDocumentSize: KnockoutComputed<string>;
+    hugeTextSize = ko.observable<number>(0);
+    isHugeDocument = ko.observable<boolean>(false);
+    ignoreHugeDocument = ko.observable<boolean>(false);
+    showHugeDocumentWarning: KnockoutComputed<boolean>;
+    
     sizeOnDiskActual = ko.observable<string>();
-    sizeOnDiskAllocated = ko.observable<String>();
+    sizeOnDiskAllocated = ko.observable<string>();
     documentSizeHtml: KnockoutComputed<string>;
     
     editedDocId: KnockoutComputed<string>;
@@ -159,7 +167,7 @@ class editDocument extends viewModelBase {
 
     collapseDocsWhenOpening = ko.observable<boolean>(false);
     isDocumentCollapsed = ko.observable<boolean>(false);
-    forceFold: boolean = false;
+    forceFold = false;
     
     constructor() {
         super();
@@ -173,6 +181,8 @@ class editDocument extends viewModelBase {
     }
 
     canActivate(args: any) {
+        this.ignoreHugeDocument(false);
+        
         return $.when<any>(super.canActivate(args))
             .then(() => {
                 if (args && args.revisionBinEntry && args.id) {
@@ -301,21 +311,17 @@ class editDocument extends viewModelBase {
     }
 
     private initValidation() {
-        const rg1 = /^[^\\]*$/; // forbidden character - backslash
-        this.userSpecifiedId.extend({
-            validation: [
-                {
-                    validator: (val: string) => rg1.test(val),
-                    message: "Can't use backslash in document name"
-                }]
-        });
-
         this.documentText.extend({
-            required: true,
+            required: {
+                onlyIf: () => !this.isHugeDocument() && this.ignoreHugeDocument()
+            },
             aceValidation: true,
             validation: [
                 {
                     validator: (val: string) => {
+                        if ((this.isHugeDocument() && !this.ignoreHugeDocument()) || this.isBusy()) {
+                            return true;
+                        }
                         try {
                             const parsedJson = JSON.parse(val);
                             return _.isPlainObject(parsedJson);
@@ -407,17 +413,68 @@ class editDocument extends viewModelBase {
             }
         });
 
+        this.isConflictRevision = ko.pureComputed(() => {
+            const doc = this.document();
+            if (doc) {
+                return doc.__metadata.hasFlag("Conflicted");
+            } else {
+                return false;
+            }
+        });
+
+        this.isResolvedRevision = ko.pureComputed(() => {
+            const doc = this.document();
+            if (doc) {
+                return doc.__metadata.hasFlag("Resolved");
+            } else {
+                return false;
+            }
+        });
+
+        this.revisionText = ko.pureComputed(() => {
+            if (!this.inReadOnlyMode()) {
+                return "";
+            }
+           
+            if (this.isDeleteRevision()) {
+                return "| DELETE REVISION";
+            }
+            
+            if (this.isConflictRevision()) {
+                return "| CONFLICT REVISION";
+            }
+
+            if (this.isResolvedRevision()) {
+                return "| RESOLVED REVISION";
+            }
+           
+            return "| REVISION";
+        });
+
         this.document.subscribe(doc => {
             if (doc) {
                 const docDto = doc.toDto(true);
                 const metaDto = docDto["@metadata"];
+                
                 if (metaDto) {
                     this.metaPropsToRestoreOnSave.length = 0;
                     documentMetadata.filterMetadata(metaDto, this.metaPropsToRestoreOnSave);
                 }
 
                 const docText = genUtils.stringify(docDto);
+                const textSizeInByes = genUtils.getSizeInBytesAsUTF8(docText);
+
+                this.isHugeDocument(textSizeInByes > document.hugeSizeInBytesDefault);
+                
+                if (this.isHugeDocument() && !this.ignoreHugeDocument()) {
+                    this.documentTextOrg(docText);
+                    this.documentText(null);
+                    this.hugeTextSize(textSizeInByes);
+                } else {
+                    this.documentTextOrg(null);
                 this.documentText(docText);
+                    this.hugeTextSize(0);
+            }
             }
         });
 
@@ -448,7 +505,10 @@ class editDocument extends viewModelBase {
 
         this.computedDocumentSize = ko.pureComputed(() => {
             try {
-                const textSize: number = genUtils.getSizeInBytesAsUTF8(this.documentText());
+                if (this.hugeTextSize()) {
+                    return genUtils.formatBytesToSize(this.hugeTextSize());
+                }
+                const textSize = genUtils.getSizeInBytesAsUTF8(this.documentText());
                 const metadataAsString = JSON.stringify(this.metadata().toDto());
                 const metadataSize = genUtils.getSizeInBytesAsUTF8(metadataAsString);
                 const metadataKey = genUtils.getSizeInBytesAsUTF8(", @metadata: ");
@@ -463,8 +523,15 @@ class editDocument extends viewModelBase {
                 return `Computed Size: ${this.computedDocumentSize()} KB`;
             }
             
-            return `<div><strong>Document Size on Disk</strong></div> Actual Size: ${this.sizeOnDiskActual()} <br/> Allocated Size: ${this.sizeOnDiskAllocated()}`;
+            const text = `<div class="margin-top-sm margin-bottom-sm"><strong>Document Size on Disk</strong></div> Actual Size: ${this.sizeOnDiskActual()} <br/> Allocated Size: ${this.sizeOnDiskAllocated()}`;
+            const hugeSizeText = this.isHugeDocument() ? `<br /><div class="text-warning bg-warning margin-top margin-bottom">Document is huge</div>` : "";
+            
+            return text + hugeSizeText;
         });
+        
+        this.documentItemType = ko.pureComputed(() => {
+            return this.inReadOnlyMode() ? 'Revision' : 'Document';
+        })
         
         this.metadata.subscribe((meta: documentMetadata) => {
             if (meta && meta.id) {
@@ -524,11 +591,19 @@ class editDocument extends viewModelBase {
         });
         
         this.canViewRelated = ko.pureComputed(() => {
-            return !this.isDeleteRevision();
+            return !this.isDeleteRevision() && (this.isClone() || !this.isCreatingNewDocument());
         });
 
         this.canViewCSharpClass = ko.pureComputed(() => {
             return !this.isCreatingNewDocument() && !this.inReadOnlyMode();
+        });
+        
+        this.showHugeDocumentWarning = ko.pureComputed(() => {
+            if (this.isBusy()) {
+                return this.isHugeDocument();
+            } else {
+                return this.isHugeDocument() && !this.ignoreHugeDocument();
+    }
         });
     }
 
@@ -547,7 +622,9 @@ class editDocument extends viewModelBase {
         }
         
         if (change.Type === 'Delete') {
-            this.displayDocumentDeleted(true);
+            if (this.editedDocId() === change.Id) {
+                this.displayDocumentDeleted(true);
+            }
         } else {
             this.displayDocumentChange(true);
         }
@@ -585,6 +662,7 @@ class editDocument extends viewModelBase {
     editNewDocument(collectionForNewDocument: string): JQueryPromise<document> {
         this.isCreatingNewDocument(true);
         this.collectionForNewDocument(collectionForNewDocument);
+        this.connectedDocuments.activateRecent();
         
         const documentTask = $.Deferred<document>();
 
@@ -620,6 +698,24 @@ class editDocument extends viewModelBase {
         return collectionForNewDocument + "/";
     }
 
+    reLoadDocument() {
+        this.ignoreHugeDocument(true);
+        
+        if (this.inReadOnlyMode()) {
+            this.loadRevision(this.revisionChangeVector());
+        } else {
+            this.loadDocument(this.document().getId());
+        }
+    }
+    
+    downloadDocument() {
+        fileDownloader.downloadAsJson(this.documentTextOrg(), this.document().getId());
+    }
+    
+    viewRaw() {
+        window.open(this.rawJsonUrl(), "_blank");
+    }
+    
     copyDocumentBodyToClipboard() {
         copyToClipboard.copy(this.documentText(), "Document has been copied to clipboard");
     }
@@ -698,7 +794,7 @@ class editDocument extends viewModelBase {
         }
     }
     
-    createClone(keepChanges: boolean = false) {
+    createClone(keepChanges = false) {
         const attachments = this.document().__metadata.attachments()
             ? this.document().__metadata.attachments().map(x => editDocument.mapToAttachmentItem(this.editedDocId(), x))
             : [];
@@ -707,10 +803,10 @@ class editDocument extends viewModelBase {
         
         const fetchCountersTask = documentHasCounters ?
             // Must get counter values from server since cloning counters is a 'create' operation (not copy)
-            this.normalActionProvider.fetchCounters("", 0, 1024 * 1024) :
+            this.normalActionProvider.fetchCounters("") :
             $.when<pagedResult<counterItem>>({ items: [], totalResultCount: 0 } as pagedResult<counterItem>);
         
-        const fetchTimeseriesTask = this.normalActionProvider.fetchTimeSeries("", 0, 1024 * 1024);
+        const fetchTimeseriesTask = this.normalActionProvider.fetchTimeSeries("");
 
         $.when<any>(fetchCountersTask, fetchTimeseriesTask)
             .done((counters: pagedResult<counterItem>, timeSeries: pagedResult<timeSeriesItem>) => {
@@ -718,7 +814,7 @@ class editDocument extends viewModelBase {
             })
     }
     
-    private createCloneInternal(attachments: attachmentItem[], timeseries: timeSeriesItem[], counters: counterItem[], keepChanges: boolean = false) {
+    private createCloneInternal(attachments: attachmentItem[], timeseries: timeSeriesItem[], counters: counterItem[], keepChanges = false) {
         // Show current document as a clone document...
         router.navigate(window.location.hash + "&isClone=true", { trigger: false, replace: false });
         
@@ -796,7 +892,7 @@ class editDocument extends viewModelBase {
         return true;
     }
     
-    private saveInternal(documentId: string, forceRevisionCreation: boolean = false) {
+    private saveInternal(documentId: string, forceRevisionCreation = false) {
         let message = "";
         let updatedDto: any;
 
@@ -842,7 +938,7 @@ class editDocument extends viewModelBase {
 
         // skip some not necessary meta in headers
         const metaToSkipInHeaders = ['Raven-Replication-History'];
-        for (let i in metaToSkipInHeaders) {
+        for (const i in metaToSkipInHeaders) {
             const skippedHeader = metaToSkipInHeaders[i];
             delete meta[skippedHeader];
         }
@@ -884,7 +980,8 @@ class editDocument extends viewModelBase {
         const currentSelection = this.docEditor.getSelectionRange();
 
         const metadata = localDoc['@metadata'];
-        for (let prop in savedDocumentDto) {
+        for (const prop in savedDocumentDto) {
+            // eslint-disable-next-line no-prototype-builtins
             if (savedDocumentDto.hasOwnProperty(prop)) {
                 if (prop === "Type")
                     continue;
@@ -1003,7 +1100,7 @@ class editDocument extends viewModelBase {
             .done((rightDoc: document) => {
                 const wasDirty = this.dirtyFlag().isDirty();
                 
-                this.documentTextStash(this.documentText());
+                this.documentTextStash(this.documentText() || this.documentTextOrg());
                 
                 const leftDoc = this.document();
                 const leftDocDto = leftDoc.toDiffDto();
@@ -1060,10 +1157,11 @@ class editDocument extends viewModelBase {
         return new getDocumentAtRevisionCommand(changeVector, this.activeDatabase())
             .execute()
             .done((doc: document) => {
+                this.inReadOnlyMode(true);
+                
                 this.document(doc);
                 this.displayDocumentChange(false);
 
-                this.inReadOnlyMode(true);
                 this.revisionChangeVector(changeVector);
 
                 this.dirtyFlag().reset();
@@ -1105,6 +1203,7 @@ class editDocument extends viewModelBase {
             viewModel.deletionTask.done(() => {
                 this.dirtyFlag().reset();
                 this.connectedDocuments.onDocumentDeleted();
+                this.displayDocumentDeleted(false);
             });
             app.showBootstrapDialog(viewModel, editDocument.editDocSelector);
         } 
@@ -1353,7 +1452,7 @@ class normalCrudActions implements editDocumentCrudActions {
             });
     }
 
-    fetchAttachments(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<attachmentItem>> {
+    fetchAttachments(nameFilter: string): JQueryPromise<pagedResult<attachmentItem>> {
         const doc = this.document();
 
         let attachments: documentAttachmentDto[] = doc.__metadata.attachments() || [];
@@ -1370,7 +1469,7 @@ class normalCrudActions implements editDocumentCrudActions {
         });
     }
     
-    fetchCounters(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<counterItem>> {
+    fetchCounters(nameFilter: string): JQueryPromise<pagedResult<counterItem>> {
         const doc = this.document();
 
         if (doc.__metadata.hasFlag("Revision")) {
@@ -1419,9 +1518,30 @@ class normalCrudActions implements editDocumentCrudActions {
         return fetchTask.promise();
     }
     
-    fetchTimeSeries(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<timeSeriesItem>> {
+    fetchTimeSeries(nameFilter: string): JQueryPromise<pagedResult<timeSeriesItem>> {
         const doc = this.document();
 
+        if (doc.__metadata.hasFlag("Revision")) {
+            let timeSeries = doc.__metadata.revisionTimeSeries();
+
+            if (nameFilter) {
+                timeSeries = timeSeries.filter(ts => ts.name.toLocaleLowerCase().includes(nameFilter));
+            }
+            
+            return $.when({
+                items: timeSeries.map(x => {
+                    return {
+                        
+                        name: x.name,
+                        numberOfEntries: x.count,
+                        startDate: x.start,
+                        endDate: x.end
+                    };
+                }),
+                totalResultCount: timeSeries.length
+            });
+        }
+        
         if (!doc.__metadata.hasFlag("HasTimeSeries")) {
             return connectedDocuments.emptyDocResult<timeSeriesItem>();
         }
@@ -1452,7 +1572,7 @@ class normalCrudActions implements editDocumentCrudActions {
     private static resultItemToCounterItem(counterDetail: Raven.Client.Documents.Operations.Counters.CounterDetail): counterItem {
         const counter = counterDetail;
 
-        let valuesPerNode = Array<nodeCounterValue>();
+        const valuesPerNode = Array<nodeCounterValue>();
         for (const nodeDetails in counter.CounterValues) {
             const [nodeTag, dbId] = _.split(nodeDetails, '-', 2);
             valuesPerNode.unshift({
@@ -1487,7 +1607,7 @@ class normalCrudActions implements editDocumentCrudActions {
             });
     }
 
-    saveRelatedItems(targetDocumentId: string) {
+    saveRelatedItems() {
         // no action required
         return $.when<void>(null);
     }
@@ -1586,7 +1706,7 @@ class clonedDocumentCrudActions implements editDocumentCrudActions {
         this.reload();
     }
 
-    fetchAttachments(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<attachmentItem>> {
+    fetchAttachments(nameFilter: string): JQueryPromise<pagedResult<attachmentItem>> {
         let attachments: attachmentItem[] = this.attachments();
 
         if (nameFilter) {
@@ -1599,7 +1719,7 @@ class clonedDocumentCrudActions implements editDocumentCrudActions {
         });
     }
 
-    fetchCounters(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<counterItem>> {
+    fetchCounters(nameFilter: string): JQueryPromise<pagedResult<counterItem>> {
         let counters: counterItem[] = this.counters();
 
         if (nameFilter) {
@@ -1612,7 +1732,7 @@ class clonedDocumentCrudActions implements editDocumentCrudActions {
         });
     }
     
-    fetchTimeSeries(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<timeSeriesItem>> {
+    fetchTimeSeries(nameFilter: string): JQueryPromise<pagedResult<timeSeriesItem>> {
         let timeseries: timeSeriesItem[] = this.timeSeries();
 
         if (nameFilter) {
@@ -1625,7 +1745,7 @@ class clonedDocumentCrudActions implements editDocumentCrudActions {
         });
     }
 
-    fetchRevisionsCount(docId: string, db: database): void {
+    fetchRevisionsCount(): void {
         // Not needed for clone view.
     }
     
@@ -1655,7 +1775,7 @@ class clonedDocumentCrudActions implements editDocumentCrudActions {
         }
     }
     
-    onDocumentSaved(saveResult: saveDocumentResponseDto, localDoc: any) {
+    onDocumentSaved(saveResult: saveDocumentResponseDto) {
         this.parentView.dirtyFlag().reset();
         router.navigate(appUrl.forEditDoc(saveResult.Results[0]["@id"], this.db()));
     }

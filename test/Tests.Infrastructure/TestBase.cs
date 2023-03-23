@@ -6,6 +6,8 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -13,10 +15,12 @@ using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using Raven.Client;
 using Raven.Client.Http;
+using Raven.Client.Properties;
 using Raven.Client.Util;
 using Raven.Debug.StackTrace;
 using Raven.Server;
 using Raven.Server.Commercial;
+using Raven.Server.Commercial.LetsEncrypt;
 using Raven.Server.Config;
 using Raven.Server.Config.Settings;
 using Raven.Server.Documents;
@@ -93,6 +97,7 @@ namespace FastTests
             IgnoreProcessorAffinityChanges(ignore: true);
             LicenseManager.AddLicenseStatusToLicenseLimitsException = true;
             RachisStateMachine.EnableDebugLongCommit = true;
+            RavenServer.SkipCertificateDispose = true;
 
             NativeMemory.GetCurrentUnmanagedThreadId = () => (ulong)Pal.rvn_get_current_thread_id();
             ZstdLib.CreateDictionaryException = message => new VoronErrorException(message);
@@ -107,6 +112,11 @@ namespace FastTests
             var packagesPath = new PathSetting(RavenTestHelper.NewDataPath("NuGetPackages", 0, forceCreateDir: true));
             GlobalPathsToDelete.Add(packagesPath.FullPath);
             MultiSourceNuGetFetcher.Instance.Initialize(packagesPath, "https://api.nuget.org/v3/index.json");
+
+            IOExtensions.AfterGc += (s, x) =>
+            {
+                Console.WriteLine($"Execution of GC due to IO failure on path '{x.Path}' took {x.Duration} (attempt: {x.Attempt})");
+            };
 
 #if DEBUG2
             TaskScheduler.UnobservedTaskException += (sender, args) =>
@@ -637,6 +647,12 @@ namespace FastTests
             var testOutcomeAnalyzer = new TestOutcomeAnalyzer(Context);
             var shouldSaveDebugPackage = testOutcomeAnalyzer.ShouldSaveDebugPackage();
 
+            exceptionAggregator.Execute(() =>
+            {
+                if (_globalServer?.ServerStore.Observer?.Suspended == true)
+                    throw new InvalidOperationException("The observer is suspended for the global server!");
+            });
+            
             Dispose(exceptionAggregator);
 
             DownloadAndSaveDebugPackage(shouldSaveDebugPackage, _globalServer, exceptionAggregator, Context);

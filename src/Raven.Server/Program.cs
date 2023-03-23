@@ -16,6 +16,7 @@ using Raven.Server.Documents.Indexes.Static.NuGet;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.BackgroundTasks;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.TrafficWatch;
 using Raven.Server.Utils;
 using Raven.Server.Utils.Cli;
 using Sparrow;
@@ -38,8 +39,8 @@ namespace Raven.Server
             NativeMemory.GetCurrentUnmanagedThreadId = () => (ulong)Pal.rvn_get_current_thread_id();
             ZstdLib.CreateDictionaryException = message => new VoronErrorException(message);
 
-            Lucene.Net.Util.UnmanagedStringArray.Segment.AllocateMemory = NativeMemory.AllocateMemory;
-            Lucene.Net.Util.UnmanagedStringArray.Segment.FreeMemory = NativeMemory.Free;
+            Lucene.Net.Util.UnmanagedStringArray.Segment.AllocateMemory = NativeMemory.AllocateMemoryByLucene;
+            Lucene.Net.Util.UnmanagedStringArray.Segment.FreeMemory = NativeMemory.FreeMemoryByLucene;
 
             UseOnlyInvariantCultureInRavenDB();
 
@@ -104,6 +105,8 @@ namespace Raven.Server
                 configuration.Logs.Compress
                 );
 
+            TrafficWatchToLog.Instance.UpdateConfiguration(configuration.TrafficWatch);
+            
             if (Logger.IsInfoEnabled)
                 Logger.Info($"Logging to {configuration.Logs.Path} set to {configuration.Logs.Mode} level.");
 
@@ -189,7 +192,7 @@ namespace Raven.Server
                             if (rerun == false && CommandLineSwitches.LaunchBrowser)
                                 BrowserHelper.OpenStudioInBrowser(server.ServerStore.GetNodeHttpServerUrl());
 
-                            new ClusterMessage(Console.Out, server.ServerStore).Print();
+                            new ClusterMessage(Console.Out, server.ServerStore.Engine.Tag, server.ServerStore.Engine.ClusterId).Print();
 
                             var prevColor = Console.ForegroundColor;
                             Console.Write("Server available on: ");

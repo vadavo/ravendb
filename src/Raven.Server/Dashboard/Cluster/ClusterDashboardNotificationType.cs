@@ -10,19 +10,23 @@ namespace Raven.Server.Dashboard.Cluster
     {
         Unknown,
         ServerTime, // used by studio to sync clocks
-        CpuUsage,
-        StorageUsage, 
-        MemoryUsage,
-        Traffic,
-        Indexing,
         
+        CpuUsage,
+        MemoryUsage,
+        IoStats,
+        
+        StorageUsage,
         DatabaseStorageUsage,
+        
+        Traffic,
         DatabaseTraffic,
+        
+        Indexing,
         DatabaseIndexing,
+        
+        ClusterOverview,
         DatabaseOverview,
         
         OngoingTasks
-        
-        //TODO: cluster topology
     }
 }

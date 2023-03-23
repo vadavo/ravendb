@@ -24,8 +24,6 @@ import queryCriteria = require("models/database/query/queryCriteria");
 import rqlLanguageService = require("common/rqlLanguageService");
 import activeDatabaseTracker = require("common/shell/activeDatabaseTracker");
 
-type fetcherType = (skip: number, take: number, previewCols: string[], fullCols: string[]) => JQueryPromise<pagedResult<document>>;
-
 class patchList {
 
     private readonly recentPatchLimit = 6;
@@ -150,6 +148,7 @@ class patch extends viewModelBase {
 
     spinners = {
         save: ko.observable<boolean>(false),
+        countMatchingDocuments: ko.observable<boolean>(false)
     };
 
     jsCompleter = defaultAceCompleter.completer();
@@ -305,8 +304,13 @@ class patch extends viewModelBase {
 
     runPatch() {
         if (this.isValid(this.patchDocument().validationGroup)) {
+            this.spinners.countMatchingDocuments(true);
+            
             this.getMatchingDocumentsNumber()
-                .done((matchingDocs: number) => this.executePatch(matchingDocs));
+                .done((matchingDocs: number) => {
+                    this.spinners.countMatchingDocuments(false);
+                    this.executePatch(matchingDocs);
+                });
         }
     }
 
@@ -388,7 +392,7 @@ class patch extends viewModelBase {
         const matchingDocs = $.Deferred<number>();
         
         if (patchScriptParts.length === 2) {
-            let query = queryCriteria.empty();
+            const query = queryCriteria.empty();
             query.queryText(patchScriptParts[0]);
 
             new queryCommand(this.activeDatabase(), 0, 0, query)

@@ -23,6 +23,7 @@ class nodeInfo {
     advancedSettingsCheckBox = ko.observable<boolean>(false);    
     showAdvancedSettings: KnockoutComputed<boolean>;
 
+    validationGroupForUnsecured: KnockoutValidationGroup;
     validationGroupForSecured: KnockoutValidationGroup;
     validationGroupForLetsEncrypt: KnockoutValidationGroup;
 
@@ -72,7 +73,7 @@ class nodeInfo {
                 }
             });
             
-            return hostName;                       
+            return hostName;
         });
 
         this.ipsContainHostName.subscribe(val => {
@@ -122,6 +123,7 @@ class nodeInfo {
     }
 
     private initValidation() {
+
         this.port.extend({
             number: true
         });
@@ -142,8 +144,8 @@ class nodeInfo {
         
         this.externalIpAddress.extend({
             required: {   
-                onlyIf: () => this.ipsContainHostName() && !this.externalIpAddress(),                
-                message: "This field is required when an address contains Hostname"
+                onlyIf: () => (this.ipsContainHostName() || this.ipContainBindAll()) && !this.externalIpAddress(),
+                message: "This field is required when an address contains Hostname or 0.0.0.0"
             },
             validIpWithoutPort: true
         });
@@ -164,7 +166,7 @@ class nodeInfo {
             ]
         });
 
-        this.validationGroupForLetsEncrypt= ko.validatedObservable({
+        this.validationGroupForLetsEncrypt = ko.validatedObservable({
             nodeTag: this.nodeTag,
             port: this.port, 
             tcpPort: this.tcpPort,
@@ -183,6 +185,13 @@ class nodeInfo {
             hostname: this.hostname,
             externalTcpPort: this.externalTcpPort,
             externalHttpsPort: this.externalHttpsPort
+        });
+
+        this.validationGroupForUnsecured = ko.validatedObservable({
+            nodeTag: this.nodeTag,
+            port: this.port,
+            tcpPort: this.tcpPort,
+            ips: this.ips
         });
     }
 
@@ -206,16 +215,17 @@ class nodeInfo {
         return serverUrl;
     }
 
-    toDto(): Raven.Server.Commercial.SetupInfo.NodeInfo {
+    toDto(): Raven.Server.Commercial.NodeInfo {
         return {
             Addresses: this.ips().map(x => x.ip()),
-            Port: this.port() ? parseInt(this.port(), 10) : null,
+            Port: this.port() ? parseInt(this.port(), 10) : this.mode() === 'Unsecured' ? 8080 : null,
+            TcpPort: this.tcpPort() ? parseInt(this.tcpPort(), 10) : this.mode() === 'Unsecured' ? 38888 : null,
             PublicServerUrl: this.getServerUrl(),
-            ExternalIpAddress: (this.advancedSettingsCheckBox() && this.externalIpAddress()) ? this.externalIpAddress() : null, 
-            TcpPort: this.tcpPort() ? parseInt(this.tcpPort(), 10) : null,
+            PublicTcpServerUrl: null,
+            ExternalIpAddress: (this.advancedSettingsCheckBox() && this.externalIpAddress()) ? this.externalIpAddress() : null,
             ExternalPort: (this.advancedSettingsCheckBox() && this.externalHttpsPort()) ? parseInt(this.externalHttpsPort(), 10) : null,
             ExternalTcpPort: (this.advancedSettingsCheckBox() && this.externalTcpPort()) ? parseInt(this.externalTcpPort(), 10) : null
-        } as Raven.Server.Commercial.SetupInfo.NodeInfo;
+        }
     }
 }
 

@@ -410,6 +410,7 @@ namespace Raven.Server.Monitoring.Snmp
             store.Add(new ServerUnmanagedMemory());
             store.Add(new ServerEncryptionBuffersMemoryInUse());
             store.Add(new ServerEncryptionBuffersMemoryInPool());
+            store.Add(new ServerAvailableMemoryForProcessing(server.MetricCacher));
 
             ServerMemInfo.Register(store, server.MetricCacher);
 
@@ -453,7 +454,12 @@ namespace Raven.Server.Monitoring.Snmp
             store.Add(new ServerStorageTotalSize(server.ServerStore));
             store.Add(new ServerStorageDiskRemainingSpace(server.ServerStore));
             store.Add(new ServerStorageDiskRemainingSpacePercentage(server.ServerStore));
-
+            store.Add(new ServerStorageDiskIosReadOperations(server.ServerStore));
+            store.Add(new ServerStorageDiskIosWriteOperations(server.ServerStore));
+            store.Add(new ServerStorageDiskReadThroughput(server.ServerStore));
+            store.Add(new ServerStorageDiskWriteThroughput(server.ServerStore));
+            store.Add(new ServerStorageDiskQueueLength(server.ServerStore));
+            
             store.Add(new ServerCertificateExpiration(server.ServerStore));
             store.Add(new ServerCertificateExpirationLeft(server.ServerStore));
             store.Add(new WellKnownAdminCertificates(server.ServerStore));
